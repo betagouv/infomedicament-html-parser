@@ -51,6 +51,7 @@ Options:
 - `--cis-file`: Text file with allowed CIS codes (default: uses database)
 - `--limite`: Limit number of files to process (for testing)
 - `--pattern`: File pattern - N=Notice, R=RCP (default: N)
+- `--batch-size`: Files per batch (default: 500). Results are written after each batch to limit memory usage.
 
 Example:
 ```bash

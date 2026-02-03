@@ -167,6 +167,7 @@ def traiter_depuis_s3(
     fichier_cis: str | None = None,
     limite: int | None = None,
     pattern: str = "N",
+    batch_size: int = 500,
 ) -> None:
     """
     Process HTML files from S3 and write results back to S3.
@@ -175,6 +176,7 @@ def traiter_depuis_s3(
         fichier_cis: Local file containing authorized CIS codes (if None, uses database)
         limite: Limit number of files to process (for testing)
         pattern: File pattern to process ("N" for Notices, "R" for RCP)
+        batch_size: Number of files to process per batch (to limit memory usage)
     """
     config = get_config()
 
@@ -237,45 +239,47 @@ def traiter_depuis_s3(
     html_keys = [f"{html_prefix}{filename}" for filename in files_to_fetch.keys()]
     if limite is not None:
         html_keys = html_keys[:limite]
-    logger.info(f"{len(html_keys)} files to download")
 
-    # Download only the files we need
-    logger.info("Downloading files...")
-    fichiers_data = []
-    for key in tqdm(html_keys, desc="Downloading", unit="file"):
-        try:
-            content = s3_client.download_file_content(key)
-            fichiers_data.append((key, content, mapping, cis_autorises))
-        except Exception as e:
-            logger.error(f"Download error for {key}: {e}")
+    total_files = len(html_keys)
+    num_batches = (total_files + batch_size - 1) // batch_size
+    logger.info(f"{total_files} files to process in {num_batches} batches of {batch_size}")
 
-    # Process files
-    logger.info("Processing files...")
-    results = []
-    files_processed = 0
-    files_skipped = 0
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    total_processed = 0
+    total_skipped = 0
 
-    for fichier_data in tqdm(fichiers_data, desc="Processing", unit="file"):
-        result = traiter_fichier_s3(fichier_data)
-        if result is not None:
-            results.append(result)
-            files_processed += 1
-        else:
-            files_skipped += 1
+    for batch_num in range(num_batches):
+        batch_start = batch_num * batch_size
+        batch_end = min(batch_start + batch_size, total_files)
+        batch_keys = html_keys[batch_start:batch_end]
 
-    logger.info(f"Processing complete: {files_processed} processed, {files_skipped} skipped")
+        logger.info(f"Batch {batch_num + 1}/{num_batches}: processing files {batch_start + 1}-{batch_end}")
 
-    # Write results to S3
-    if results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}.jsonl"
+        # Download batch
+        batch_results = []
+        for key in tqdm(batch_keys, desc=f"Batch {batch_num + 1}", unit="file"):
+            try:
+                content = s3_client.download_file_content(key)
+                result = traiter_fichier_s3((key, content, mapping, cis_autorises))
+                if result is not None:
+                    batch_results.append(result)
+                    total_processed += 1
+                else:
+                    total_skipped += 1
+            except Exception as e:
+                logger.error(f"Error processing {key}: {e}")
+                total_skipped += 1
 
-        output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in results)
-        s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
+        # Write batch results to S3
+        if batch_results:
+            output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}_batch{batch_num + 1:03d}.jsonl"
+            output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in batch_results)
+            s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
+            logger.info(f"Batch {batch_num + 1} written to S3: {output_key} ({len(batch_results)} results)")
 
-        logger.info(f"Results written to S3: {output_key}")
-    else:
-        logger.warning("No results to write")
+        # Memory is freed when batch_results goes out of scope
+
+    logger.info(f"Processing complete: {total_processed} processed, {total_skipped} skipped")
 
 
 def main():
@@ -322,6 +326,7 @@ Environment variables for database:
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
     s3_parser.add_argument("--limite", type=int, help="Limit number of files to process")
     s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
+    s3_parser.add_argument("--batch-size", type=int, default=500, help="Files per batch (default: 500)")
 
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -356,6 +361,7 @@ Environment variables for database:
                 fichier_cis=args.cis_file,
                 limite=args.limite,
                 pattern=args.pattern,
+                batch_size=args.batch_size,
             )
         except Exception as e:
             logger.exception(f"Error: {e}")
