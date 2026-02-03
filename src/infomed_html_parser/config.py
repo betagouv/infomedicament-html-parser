@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -44,7 +45,25 @@ class DatabaseConfig:
 
     @classmethod
     def from_env(cls) -> "DatabaseConfig":
-        """Load database config from environment variables."""
+        """
+        Load database config from environment variables.
+
+        Supports two formats:
+        1. DATABASE_URL or SCALINGO_MYSQL_URL (e.g., mysql://user:pass@host:port/db)
+        2. Individual MYSQL_* environment variables (fallback for local dev)
+        """
+        database_url = os.environ.get("DATABASE_URL") or os.environ.get("SCALINGO_MYSQL_URL")
+
+        if database_url:
+            parsed = urlparse(database_url)
+            return cls(
+                host=parsed.hostname or "localhost",
+                user=parsed.username or "root",
+                password=parsed.password or "",
+                database=parsed.path.lstrip("/") if parsed.path else "pdbm_bdd",
+                port=parsed.port or 3306,
+            )
+
         return cls(
             host=os.environ.get("MYSQL_HOST", "localhost"),
             user=os.environ.get("MYSQL_USER", "root"),
