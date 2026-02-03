@@ -24,7 +24,7 @@ class S3Config:
             access_key=os.environ.get("S3_KEY_ID", ""),
             secret_key=os.environ.get("S3_KEY_SECRET", ""),
             bucket_name=os.environ.get("S3_BUCKET_NAME", "info-medicaments"),
-            html_prefix=os.environ.get("S3_HTML_PREFIX", "imports/Mocahtml/"),
+            html_prefix=os.environ.get("S3_HTML_PREFIX", "imports/notice/"),
             output_prefix=os.environ.get("S3_OUTPUT_PREFIX", "exports/parsed/"),
         )
 

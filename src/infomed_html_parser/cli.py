@@ -221,6 +221,20 @@ def traiter_depuis_s3(
         logger.warning("No files to process after filtering")
         return
 
+    # List existing files in S3 to avoid NoSuchKey errors
+    logger.info("Listing existing files in S3...")
+    existing_keys = set(s3_client.list_html_files(pattern if pattern != "NR" else ""))
+    existing_filenames = {key.split("/")[-1] for key in existing_keys}
+    logger.info(f"{len(existing_filenames)} files exist in S3")
+
+    # Filter to only files that exist in S3
+    files_to_fetch = {f: cis for f, cis in files_to_fetch.items() if f in existing_filenames}
+    logger.info(f"{len(files_to_fetch)} files to download after S3 existence check")
+
+    if not files_to_fetch:
+        logger.warning("No files to process after S3 existence check")
+        return
+
     # Build full S3 keys from filenames
     html_keys = [f"{config.s3.html_prefix}{filename}" for filename in files_to_fetch.keys()]
     if limite is not None:
