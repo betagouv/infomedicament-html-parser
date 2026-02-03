@@ -104,7 +104,7 @@ def traiter_dossier_local(
         fichier_sortie: Output JSONL file
         limite: Limit number of files to process (for testing)
         num_processes: Number of processes to use (default: CPU count)
-        pattern: File pattern to process ("N" for Notices, "R" for RCP, "NR" for both)
+        pattern: File pattern to process ("N" for Notices, "R" for RCP)
     """
     if num_processes is None:
         num_processes = mp.cpu_count()
@@ -112,10 +112,7 @@ def traiter_dossier_local(
     logger.info(f"Local mode - {num_processes} processes")
 
     # Build glob pattern
-    if pattern == "NR":
-        fichiers = glob.glob(os.path.join(dossier_html, "[NR]*.htm"))
-    else:
-        fichiers = glob.glob(os.path.join(dossier_html, f"{pattern}*.htm"))
+    fichiers = glob.glob(os.path.join(dossier_html, f"{pattern}*.htm"))
 
     if limite is not None:
         fichiers = fichiers[:limite]
@@ -188,7 +185,8 @@ def traiter_depuis_s3(
 
     logger.info("S3 mode - Clever Cloud Cellar")
     logger.info(f"Bucket: {config.s3.bucket_name}")
-    logger.info(f"HTML prefix: {config.s3.html_prefix}")
+    html_prefix = config.s3.notice_prefix if pattern == "N" else config.s3.rcp_prefix
+    logger.info(f"HTML prefix: {html_prefix}")
 
     # Load CIS list from file or database
     if fichier_cis:
@@ -213,7 +211,7 @@ def traiter_depuis_s3(
     files_to_fetch = {
         filename: cis
         for filename, cis in mapping.items()
-        if cis in cis_autorises and filename.startswith(pattern if pattern != "NR" else ("N", "R"))
+        if cis in cis_autorises and filename.startswith(pattern)
     }
     logger.info(f"{len(files_to_fetch)} files match authorized CIS codes with pattern '{pattern}'")
 
@@ -223,7 +221,7 @@ def traiter_depuis_s3(
 
     # List existing files in S3 to avoid NoSuchKey errors
     logger.info("Listing existing files in S3...")
-    existing_keys = set(s3_client.list_html_files(pattern if pattern != "NR" else ""))
+    existing_keys = set(s3_client.list_html_files(pattern))
     existing_filenames = {key.split("/")[-1] for key in existing_keys}
     logger.info(f"{len(existing_filenames)} files exist in S3")
 
@@ -236,7 +234,7 @@ def traiter_depuis_s3(
         return
 
     # Build full S3 keys from filenames
-    html_keys = [f"{config.s3.html_prefix}{filename}" for filename in files_to_fetch.keys()]
+    html_keys = [f"{html_prefix}{filename}" for filename in files_to_fetch.keys()]
     if limite is not None:
         html_keys = html_keys[:limite]
     logger.info(f"{len(html_keys)} files to download")
@@ -317,13 +315,13 @@ Environment variables for database:
     local_parser.add_argument("--output", "-o", default="output.jsonl", help="Output JSONL file")
     local_parser.add_argument("--limite", type=int, help="Limit number of files to process")
     local_parser.add_argument("--processes", type=int, default=None, help="Number of processes")
-    local_parser.add_argument("--pattern", default="N", choices=["N", "R", "NR"], help="N=Notice, R=RCP, NR=both")
+    local_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
 
     # S3 mode
     s3_parser = subparsers.add_parser("s3", help="Process from S3 (Clever Cloud Cellar)")
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
     s3_parser.add_argument("--limite", type=int, help="Limit number of files to process")
-    s3_parser.add_argument("--pattern", default="N", choices=["N", "R", "NR"], help="N=Notice, R=RCP, NR=both")
+    s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
 
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")

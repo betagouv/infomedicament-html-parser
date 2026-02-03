@@ -28,12 +28,12 @@ Options:
 - `--output, -o`: Output JSONL file (default: output.jsonl)
 - `--limite`: Limit number of files to process (for testing)
 - `--processes`: Number of parallel processes (default: CPU count)
-- `--pattern`: File pattern - N=Notice, R=RCP, NR=both (default: N)
+- `--pattern`: File pattern - N=Notice, R=RCP (default: N)
 
 Example:
 ```bash
 # Uses database for CIS list (Specialite.isBdm)
-poetry run infomed-html-parser local ./html_files -o output.jsonl --pattern NR
+poetry run infomed-html-parser local ./html_files -o output.jsonl --pattern N
 
 # With CIS file override
 poetry run infomed-html-parser local ./html_files --cis-file cis_list.txt -o output.jsonl
@@ -50,7 +50,7 @@ poetry run infomed-html-parser s3 [options]
 Options:
 - `--cis-file`: Text file with allowed CIS codes (default: uses database)
 - `--limite`: Limit number of files to process (for testing)
-- `--pattern`: File pattern - N=Notice, R=RCP, NR=both (default: N)
+- `--pattern`: File pattern - N=Notice, R=RCP (default: N)
 
 Example:
 ```bash
@@ -69,7 +69,8 @@ poetry run infomed-html-parser s3 --pattern R --limite 100
 - `S3_KEY_ID`: S3 access key (required for S3 mode)
 - `S3_KEY_SECRET`: S3 secret key (required for S3 mode)
 - `S3_BUCKET_NAME`: Bucket name (default: info-medicaments)
-- `S3_HTML_PREFIX`: Prefix for HTML files (default: exports/html/)
+- `S3_HTML_NOTICE_PREFIX`: Prefix for Notice HTML files (default: imports/notice/)
+- `S3_HTML_RCP_PREFIX`: Prefix for RCP HTML files (default: imports/rcp/)
 - `S3_OUTPUT_PREFIX`: Prefix for output files (default: exports/parsed/)
 
 ### Database Configuration
@@ -117,9 +118,6 @@ scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N"
 
 # Parse RCP files (R*.htm)
 scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern R"
-
-# Parse both
-scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern NR"
 
 # Test with a limit
 scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N --limite 10"

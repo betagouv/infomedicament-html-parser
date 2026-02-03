@@ -38,19 +38,17 @@ class S3Client:
             )
         return self._client
 
-    def list_html_files(self, pattern: str = "") -> Iterator[str]:
+    def list_html_files(self, pattern: str) -> Iterator[str]:
         """
         List HTML files in the bucket matching the pattern.
 
         Args:
-            pattern: Filter pattern (e.g., "N" for Notice files, "R" for RCP files)
+            pattern: "N" for Notice files, "R" for RCP files
 
         Yields:
             Object keys for matching HTML files
         """
-        prefix = self.config.html_prefix
-        if pattern:
-            prefix = f"{prefix}{pattern}"
+        prefix = self.config.notice_prefix if pattern == "N" else self.config.rcp_prefix
 
         paginator = self.client.get_paginator("list_objects_v2")
 

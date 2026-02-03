@@ -13,7 +13,8 @@ class S3Config:
     access_key: str
     secret_key: str
     bucket_name: str
-    html_prefix: str  # Prefix for HTML files in bucket (e.g., "exports/html/")
+    notice_prefix: str  # Prefix for Notices HTML files in bucket
+    rcp_prefix: str # Prefix for RCP HTML files in bucket
     output_prefix: str  # Prefix for output files (e.g., "exports/parsed/")
 
     @classmethod
@@ -24,7 +25,8 @@ class S3Config:
             access_key=os.environ.get("S3_KEY_ID", ""),
             secret_key=os.environ.get("S3_KEY_SECRET", ""),
             bucket_name=os.environ.get("S3_BUCKET_NAME", "info-medicaments"),
-            html_prefix=os.environ.get("S3_HTML_PREFIX", "imports/notice/"),
+            notice_prefix=os.environ.get("S3_HTML_NOTICE_PREFIX", "imports/notice/"),
+            rcp_prefix=os.environ.get("S3_HTML_RCP_PREFIX", "imports/rcp/"),
             output_prefix=os.environ.get("S3_OUTPUT_PREFIX", "exports/parsed/"),
         )
 
