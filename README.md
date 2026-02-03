@@ -115,19 +115,13 @@ Run parsing tasks as one-off containers (pass the full command):
 
 ```bash
 # Parse Notice files (N*.htm)
-scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N"
+scalingo --app your-app run --size 2XL "python -m infomed_html_parser.cli s3 --pattern N --batch-size 1000"
 
 # Parse RCP files (R*.htm)
-scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern R"
+scalingo --app your-app run --size 2XL "python -m infomed_html_parser.cli s3 --pattern R --batch-size 1000"
 
 # Test with a limit
 scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N --limite 10"
-```
-
-You can also just "scale up" corresponding containers in the Scalingo UI in the /resources page. Or via the CLI :
-
-```bash
-scalingo --app your-app scale parseall:1:XL
 ```
 
 
