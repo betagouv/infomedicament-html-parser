@@ -78,7 +78,12 @@ The database is used for two purposes:
 1. **CIS list**: By default, authorized CIS codes are loaded from `SELECT SpecId FROM Specialite WHERE isBdm`
 2. **Filename mapping**: Maps HTML filenames to CIS codes via the `Spec_Doc` and `Document` tables
 
-Environment variables:
+Two configuration formats are supported:
+
+**Option 1: Connection URL (recommended for Scalingo)**
+- `DATABASE_URL` or `SCALINGO_MYSQL_URL`: Full connection string (e.g., `mysql://user:pass@host:port/database`)
+
+**Option 2: Individual variables (for local development)**
 - `MYSQL_HOST` (default: localhost)
 - `MYSQL_USER` (default: root)
 - `MYSQL_PASSWORD` (default: mysql)
@@ -92,33 +97,49 @@ Environment variables:
 
 ## Scalingo Deployment
 
-This project is designed to run as scheduled tasks on Scalingo.
+This project is a [web-less application](https://doc.scalingo.com/platform/app/web-less-app) designed to run as scheduled tasks on Scalingo.
 
-### Procfile
+### Initial Setup
 
-The `Procfile` defines three task types:
+After the first deployment, scale the web process to 0:
 
-```
-parse-notices: python -m infomed_html_parser.cli s3 --pattern N
-parse-rcp: python -m infomed_html_parser.cli s3 --pattern R
-parse-all: python -m infomed_html_parser.cli s3 --pattern NR
+```bash
+scalingo --app your-app scale web:0
 ```
 
 ### Running Tasks
 
-Use Scalingo Scheduler or run as one-off containers:
+Run parsing tasks as one-off containers (pass the full command):
 
 ```bash
-# Run via Scalingo CLI
-scalingo --app your-app run parse-notices
-scalingo --app your-app run parse-rcp
+# Parse Notice files (N*.htm)
+scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N"
+
+# Parse RCP files (R*.htm)
+scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern R"
+
+# Parse both
+scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern NR"
+
+# Test with a limit
+scalingo --app your-app run "python -m infomed_html_parser.cli s3 --pattern N --limite 10"
 ```
 
-### Required Environment Variables on Scalingo
+You can also just "scale up" corresponding containers in the Scalingo UI in the /resources page. Or via the CLI :
+
+```bash
+scalingo --app your-app scale parseall:1:XL
+```
+
+
+For automated execution, we will use [Scalingo Scheduler](https://doc.scalingo.com/platform/app/task-scheduling/scalingo-scheduler) with a `cron.json` file.
+
+### Required Environment Variables
 
 Set these in your Scalingo app settings:
+
 - `S3_KEY_ID` and `S3_KEY_SECRET` (from Clever Cloud Cellar addon)
-- `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` (database connection)
+- `DATABASE_URL`: Copy the MySQL connection string from the app containing the database addon
 
 ## Development
 
