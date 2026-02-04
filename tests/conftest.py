@@ -12,3 +12,15 @@ def sample_notice_html() -> str:
     """Load sample Notice HTML file."""
     sample_file = FIXTURES_DIR / "N0314839.htm"
     return sample_file.read_bytes().decode("utf-8", errors="replace")
+
+
+@pytest.fixture
+def sample_atc_sql() -> Path:
+    """Return the path to the sample ATC SQL file."""
+    return FIXTURES_DIR / "ClasseATC_sample.sql"
+
+
+@pytest.fixture
+def tmp_csv(tmp_path: Path) -> Path:
+    """Return a temporary path for CSV output."""
+    return tmp_path / "output.csv"
