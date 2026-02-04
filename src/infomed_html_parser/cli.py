@@ -7,6 +7,7 @@ import logging
 import multiprocessing as mp
 import os
 from datetime import datetime
+from pathlib import Path
 
 import chardet
 from tqdm import tqdm
@@ -16,6 +17,7 @@ from .db import get_authorized_cis, get_filename_to_cis_mapping
 from .io import charger_liste_cis
 from .parser import html_vers_json
 from .s3 import S3Client
+from .sql_to_csv import sql_to_csv
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +330,13 @@ Environment variables for database:
     s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
     s3_parser.add_argument("--batch-size", type=int, default=500, help="Files per batch (default: 500)")
 
+    # SQL to CSV mode
+    sql_parser = subparsers.add_parser("sql-to-csv", help="Convert SQL INSERT statements to CSV")
+    sql_parser.add_argument("sql_file", help="SQL file to convert")
+    sql_parser.add_argument("--output", "-o", help="Output CSV file (default: same name with .csv)")
+    sql_parser.add_argument("--encoding", "-e", default="iso-8859-1", help="Source file encoding")
+    sql_parser.add_argument("--dialect", "-d", default="tsql", help="SQL dialect (tsql, mysql, postgres)")
+
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
 
@@ -363,6 +372,14 @@ Environment variables for database:
                 pattern=args.pattern,
                 batch_size=args.batch_size,
             )
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "sql-to-csv":
+        try:
+            output_path = Path(args.output) if args.output else None
+            sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
