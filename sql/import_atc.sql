@@ -5,29 +5,37 @@
 --      infomed-html-parser sql-to-csv ClasseATC_data.sql -o classe_atc.csv
 --      infomed-html-parser sql-to-csv VUClassesATC_data.sql -o cis_atc.csv
 --
---   2. Run the Kysely migration infomedicament:
+--   2. Run the Kysely migration in infomedicament:
 --      npm run db:migrate:latest
 --
 -- Usage:
---   psql -v atc_csv="$ATC_CSV_PATH" -v cis_atc_csv="$CIS_ATC_CSV_PATH" -d <database> -f import_atc.sql
+--   Connect to the database interactively and run the \copy commands manually,
+--   replacing the file paths with absolute paths to the CSV files.
 --
--- Or with a connexion string:
---   psql -v atc_csv="$ATC_CSV_PATH" -v cis_atc_csv="$CIS_ATC_CSV_PATH" $APP_DB_URL -f import_atc.sql
+--   NOTE: \copy does NOT support psql variable interpolation (:'var' syntax).
+--   This is a documented psql limitation, not a bug.
+--   See: https://www.postgresql.org/docs/current/app-psql.html
 --
 -- Example:
---   export ATC_CSV_PATH=/path/to/classe_atc.csv
---   export CIS_ATC_CSV_PATH=/path/to/cis_atc.csv
---   psql -v atc_csv="$ATC_CSV_PATH" -v cis_atc_csv="$CIS_ATC_CSV_PATH" $APP_DB_URL -f import_atc.sql
+--   psql $APP_DB_URL
+--   -- Then paste the commands below, replacing paths:
+--
+--   TRUNCATE TABLE cis_atc CASCADE;
+--   TRUNCATE TABLE atc CASCADE;
+--   \copy atc(code_terme, code_terme_pere, code, label_court, label_long, label_anglais, label_recherche, num_ordre_edit, date_creation, date_modification, date_inactivation, source_ref, remarque) FROM '/absolute/path/to/classe_atc.csv' WITH (FORMAT csv, HEADER true, NULL '');
+--   \copy cis_atc(code_cis, code_terme_atc, est_valide, est_certain, commentaire, date_creation, date_modification, code_modif) FROM '/absolute/path/to/cis_atc.csv' WITH (FORMAT csv, HEADER true, NULL '');
 
 -- Empty existing tables
 TRUNCATE TABLE cis_atc CASCADE;
 TRUNCATE TABLE atc CASCADE;
 
 -- Load ATC
-\copy atc(code_terme, code_terme_pere, code, label_court, label_long, label_anglais, label_recherche, num_ordre_edit, date_creation, date_modification, date_inactivation, source_ref, remarque) FROM :'atc_csv' WITH (FORMAT csv, HEADER true, NULL '');
+-- Replace the path below with the absolute path to classe_atc.csv
+\copy atc(code_terme, code_terme_pere, code, label_court, label_long, label_anglais, label_recherche, num_ordre_edit, date_creation, date_modification, date_inactivation, source_ref, remarque) FROM '/path/to/classe_atc.csv' WITH (FORMAT csv, HEADER true, NULL '');
 
 -- Load CIS-ATC
-\copy cis_atc(code_cis, code_terme_atc, est_valide, est_certain, commentaire, date_creation, date_modification, code_modif) FROM :'cis_atc_csv' WITH (FORMAT csv, HEADER true, NULL '');
+-- Replace the path below with the absolute path to cis_atc.csv
+\copy cis_atc(code_cis, code_terme_atc, est_valide, est_certain, commentaire, date_creation, date_modification, code_modif) FROM '/path/to/cis_atc.csv' WITH (FORMAT csv, HEADER true, NULL '');
 
 -- Check
 SELECT 'atc' as table_name, COUNT(*) as row_count FROM atc
