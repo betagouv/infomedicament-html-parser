@@ -281,16 +281,105 @@ def traiter_depuis_s3(
                 logger.error(f"Error processing {key}: {e}")
                 total_skipped += 1
 
-        # Write batch results to S3
+        # Write batch results
         if batch_results:
-            output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}_batch{batch_num + 1:03d}.jsonl"
-            output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in batch_results)
-            s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
-            logger.info(f"Batch {batch_num + 1} written to S3: {output_key} ({len(batch_results)} results)")
-
-        # Memory is freed when batch_results goes out of scope
+            if fichier_sortie:
+                with open(fichier_sortie, "a", encoding="utf-8") as f_out:
+                    for r in batch_results:
+                        f_out.write(json.dumps(r, ensure_ascii=False) + "\n")
+                logger.info(f"Batch {batch_num + 1} appended to {fichier_sortie} ({len(batch_results)} results)")
+            else:
+                output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}_batch{batch_num + 1:03d}.jsonl"
+                output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in batch_results)
+                s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
+                logger.info(f"Batch {batch_num + 1} written to S3: {output_key} ({len(batch_results)} results)")
 
     logger.info(f"Processing complete: {total_processed} processed, {total_skipped} skipped")
+
+
+def run_pediatric_classification(
+    rcp_path: str,
+    truth_path: str | None,
+    output_path: str,
+) -> None:
+    """Run pediatric classification on parsed RCPs and optionally evaluate."""
+    from .pediatric import (
+        classify,
+        compute_metrics,
+        format_metrics,
+        load_ground_truth,
+    )
+
+    # Load ground truth (for ATC codes and evaluation)
+    ground_truth = {}
+    if truth_path:
+        ground_truth = load_ground_truth(truth_path)
+        logger.info(f"Ground truth loaded: {len(ground_truth)} entries")
+
+    # Load and classify each RCP
+    predictions = []
+    with open(rcp_path, encoding="utf-8") as f:
+        for line in f:
+            rcp_json = json.loads(line)
+            source = rcp_json.get("source", {})
+            cis = source.get("cis", "") if isinstance(source, dict) else ""
+            atc_code = ground_truth.get(cis, {}).get("atc", "")
+            pred = classify(rcp_json, atc_code=atc_code)
+            predictions.append(pred)
+
+    logger.info(f"Classified {len(predictions)} drugs")
+
+    # Write predictions CSV
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        header = ["cis", "pred_A", "pred_B", "pred_C"]
+        if ground_truth:
+            header += ["truth_A", "truth_B", "truth_C", "match_A", "match_B", "match_C"]
+        header += ["c_reasons", "keywords_41_42", "keywords_43", "evidence_41_42", "evidence_43"]
+        writer.writerow(header)
+
+        for pred in predictions:
+            gt = ground_truth.get(pred.cis, {})
+            row = [
+                pred.cis,
+                int(pred.condition_a),
+                int(pred.condition_b),
+                int(pred.condition_c),
+            ]
+            if ground_truth:
+                truth_a = gt.get("A", "")
+                truth_b = gt.get("B", "")
+                truth_c = gt.get("C", "")
+                row += [
+                    int(truth_a) if isinstance(truth_a, bool) else "",
+                    int(truth_b) if isinstance(truth_b, bool) else "",
+                    int(truth_c) if isinstance(truth_c, bool) else "",
+                    int(pred.condition_a == truth_a) if isinstance(truth_a, bool) else "",
+                    int(pred.condition_b == truth_b) if isinstance(truth_b, bool) else "",
+                    int(pred.condition_c == truth_c) if isinstance(truth_c, bool) else "",
+                ]
+            # Explainability columns
+            kw_41_42 = []
+            for m in pred.matches_41_42:
+                kw_41_42.extend(m.keywords)
+            kw_43 = []
+            for m in pred.matches_43:
+                kw_43.extend(m.keywords)
+            row += [
+                " | ".join(pred.c_reasons),
+                " | ".join(dict.fromkeys(kw_41_42)),
+                " | ".join(dict.fromkeys(kw_43)),
+                " ||| ".join(m.text[:200] for m in pred.matches_41_42),
+                " ||| ".join(m.text[:200] for m in pred.matches_43),
+            ]
+            writer.writerow(row)
+
+    logger.info(f"Predictions written to {output_path}")
+
+    # Evaluate if ground truth provided
+    if ground_truth:
+        metrics = compute_metrics(predictions, ground_truth)
+        print(format_metrics(metrics))
 
 
 def main():
@@ -347,6 +436,12 @@ Environment variables for database:
     sql_parser.add_argument("--encoding", "-e", default="iso-8859-1", help="Source file encoding")
     sql_parser.add_argument("--dialect", "-d", default="tsql", help="SQL dialect (tsql, mysql, postgres)")
 
+    # Pediatric classification mode
+    ped_parser = subparsers.add_parser("classify-pediatric", help="Classify drugs for pediatric use")
+    ped_parser.add_argument("--rcp", required=True, help="Parsed RCP JSONL file")
+    ped_parser.add_argument("--truth", help="Ground truth CSV (for evaluation)")
+    ped_parser.add_argument("--output", "-o", default="data/predictions.csv", help="Output predictions CSV")
+
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
 
@@ -391,6 +486,13 @@ Environment variables for database:
         try:
             output_path = Path(args.output) if args.output else None
             sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "classify-pediatric":
+        try:
+            run_pediatric_classification(args.rcp, args.truth, args.output)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
