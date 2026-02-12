@@ -303,31 +303,56 @@ def run_pediatric_classification(
     output_path: str,
 ) -> None:
     """Run pediatric classification on parsed RCPs and optionally evaluate."""
+    from .db import get_cis_atc_mapping
     from .pediatric import (
+        PediatricClassification,
         classify,
         compute_metrics,
         format_metrics,
         load_ground_truth,
     )
 
-    # Load ground truth (for ATC codes and evaluation)
+    # Load ground truth for evaluation
     ground_truth = {}
     if truth_path:
         ground_truth = load_ground_truth(truth_path)
         logger.info(f"Ground truth loaded: {len(ground_truth)} entries")
 
-    # Load and classify each RCP
-    predictions = []
+    # Load ATC codes from PostgreSQL
+    atc_mapping = get_cis_atc_mapping()
+    logger.info(f"ATC mapping loaded: {len(atc_mapping)} entries")
+
+    # Index parsed RCPs by CIS code
+    rcp_by_cis: dict[str, dict] = {}
     with open(rcp_path, encoding="utf-8") as f:
         for line in f:
             rcp_json = json.loads(line)
             source = rcp_json.get("source", {})
             cis = source.get("cis", "") if isinstance(source, dict) else ""
-            atc_code = ground_truth.get(cis, {}).get("atc", "")
-            pred = classify(rcp_json, atc_code=atc_code)
-            predictions.append(pred)
+            if cis:
+                rcp_by_cis[cis] = rcp_json
 
-    logger.info(f"Classified {len(predictions)} drugs")
+    logger.info(f"Loaded {len(rcp_by_cis)} parsed RCPs")
+
+    # Determine which CIS codes to include in output
+    if ground_truth:
+        all_cis = list(ground_truth.keys())
+    else:
+        all_cis = list(rcp_by_cis.keys())
+
+    # Classify each CIS
+    predictions: list[PediatricClassification | None] = []
+    missing_rcp = 0
+    for cis in all_cis:
+        rcp_json = rcp_by_cis.get(cis)
+        if rcp_json:
+            atc_code = atc_mapping.get(cis, "")
+            predictions.append(classify(rcp_json, atc_code=atc_code))
+        else:
+            predictions.append(None)
+            missing_rcp += 1
+
+    logger.info(f"Classified {len(all_cis) - missing_rcp} drugs, {missing_rcp} missing RCP")
 
     # Write predictions CSV
     with open(output_path, "w", encoding="utf-8", newline="") as f:
@@ -338,8 +363,26 @@ def run_pediatric_classification(
         header += ["c_reasons", "keywords_41_42", "keywords_43", "evidence_41_42", "evidence_43"]
         writer.writerow(header)
 
-        for pred in predictions:
-            gt = ground_truth.get(pred.cis, {})
+        for cis, pred in zip(all_cis, predictions):
+            gt = ground_truth.get(cis, {})
+
+            if pred is None:
+                # No parsed RCP available
+                row = [cis, "", "", ""]
+                if ground_truth:
+                    truth_a = gt.get("A", "")
+                    truth_b = gt.get("B", "")
+                    truth_c = gt.get("C", "")
+                    row += [
+                        int(truth_a) if isinstance(truth_a, bool) else "",
+                        int(truth_b) if isinstance(truth_b, bool) else "",
+                        int(truth_c) if isinstance(truth_c, bool) else "",
+                        "", "", "",
+                    ]
+                row += ["RCP manquant", "", "", "", ""]
+                writer.writerow(row)
+                continue
+
             row = [
                 pred.cis,
                 int(pred.condition_a),
@@ -378,7 +421,8 @@ def run_pediatric_classification(
 
     # Evaluate if ground truth provided
     if ground_truth:
-        metrics = compute_metrics(predictions, ground_truth)
+        classified = [p for p in predictions if p is not None]
+        metrics = compute_metrics(classified, ground_truth)
         print(format_metrics(metrics))
 
 
