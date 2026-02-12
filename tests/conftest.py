@@ -63,9 +63,9 @@ def ground_truth_csv(tmp_path: Path) -> Path:
     """Write a small ground truth CSV and return its path."""
     gt_file = tmp_path / "gt.csv"
     gt_file.write_text(
-        "cis,code_atc,A:Indication,B:Contre-indication,C:Sur avis\n"
-        "12345,N02BE01,oui,non,non\n"
-        "67890,G03AA07,non,non,oui\n",
+        "CIS,A:Indication,B:Contre-indication,C:Sur avis\n"
+        "12345,oui,non,non\n"
+        "67890,non,non,oui\n",
         encoding="utf-8",
     )
     return gt_file

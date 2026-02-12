@@ -278,21 +278,22 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
 # --- Evaluation ---
 
 def load_ground_truth(path: str) -> dict[str, dict]:
-    """Load ground truth CSV. Returns dict keyed by CIS code."""
+    """Load ground truth CSV. Returns dict keyed by CIS code.
+
+    Expected format: CIS,A:...,B:...,C:... (4 columns, oui/non values).
+    """
     gt = {}
     with open(path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         cols = reader.fieldnames or []
-        # Columns: cis, code_atc, A:..., B:..., C:...
-        a_col, b_col, c_col = cols[2], cols[3], cols[4]
+        cis_col, a_col, b_col, c_col = cols[0], cols[1], cols[2], cols[3]
 
         for row in reader:
-            cis = row["cis"].strip()
+            cis = row[cis_col].strip()
             gt[cis] = {
                 "A": row[a_col].strip().lower() == "oui",
                 "B": row[b_col].strip().lower() == "oui",
                 "C": row[c_col].strip().lower() == "oui",
-                "atc": row.get("code_atc", "").strip(),
             }
     return gt
 

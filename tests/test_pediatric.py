@@ -201,4 +201,3 @@ class TestLoadGroundTruth:
         assert gt["12345"]["A"] is True
         assert gt["12345"]["B"] is False
         assert gt["67890"]["C"] is True
-        assert gt["67890"]["atc"] == "G03AA07"

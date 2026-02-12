@@ -12,11 +12,16 @@ def charger_html(fichier_html: str) -> str:
 
 
 def charger_liste_cis(fichier_cis: str) -> set[str]:
-    """Load the list of CIS codes from a text file."""
+    """Load the list of CIS codes from a text or CSV file.
+
+    Supports plain text (one CIS per line) and CSV files (takes the first
+    column, skips header if present).
+    """
     cis_autorises = set()
     with open(fichier_cis, "r", encoding="utf-8") as f:
         for ligne in f:
-            cis = ligne.strip()
-            if cis:  # Ignore empty lines
+            # Take first field (handles both plain text and CSV)
+            cis = ligne.strip().split(",")[0].strip()
+            if cis and cis.isdigit():
                 cis_autorises.add(cis)
     return cis_autorises

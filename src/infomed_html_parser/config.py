@@ -76,11 +76,52 @@ class DatabaseConfig:
 
 
 @dataclass
+class PostgresConfig:
+    """PostgreSQL database configuration (for ATC data)."""
+
+    host: str
+    user: str
+    password: str
+    database: str
+    port: int
+
+    @classmethod
+    def from_env(cls) -> "PostgresConfig":
+        """
+        Load PostgreSQL config from environment variables.
+
+        Supports two formats:
+        1. POSTGRESQL_URL or SCALINGO_POSTGRESQL_URL (e.g., postgres://user:pass@host:port/db)
+        2. Individual PG_* environment variables (fallback for local dev)
+        """
+        database_url = os.environ.get("POSTGRESQL_URL") or os.environ.get("SCALINGO_POSTGRESQL_URL")
+
+        if database_url:
+            parsed = urlparse(database_url)
+            return cls(
+                host=parsed.hostname or "localhost",
+                user=parsed.username or "postgres",
+                password=parsed.password or "postgres",
+                database=parsed.path.lstrip("/") if parsed.path else "postgres",
+                port=parsed.port or 5432,
+            )
+
+        return cls(
+            host=os.environ.get("PG_HOST", "localhost"),
+            user=os.environ.get("PG_USER", "postgres"),
+            password=os.environ.get("PG_PASSWORD", "postgres"),
+            database=os.environ.get("PG_DATABASE", "postgres"),
+            port=int(os.environ.get("PG_PORT", "5432")),
+        )
+
+
+@dataclass
 class AppConfig:
     """Application configuration."""
 
     s3: S3Config
     database: DatabaseConfig
+    postgres: PostgresConfig
     cdn_base_url: str
     log_level: str
 
@@ -90,6 +131,7 @@ class AppConfig:
         return cls(
             s3=S3Config.from_env(),
             database=DatabaseConfig.from_env(),
+            postgres=PostgresConfig.from_env(),
             cdn_base_url=os.environ.get(
                 "CDN_BASE_URL", "https://cellar-c2.services.clever-cloud.com/info-medicaments/exports/images"
             ),
