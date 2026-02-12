@@ -1,6 +1,7 @@
 """Command-line interface for the HTML parser."""
 
 import argparse
+import csv
 import glob
 import json
 import logging
@@ -167,15 +168,17 @@ def traiter_dossier_local(
 
 def traiter_depuis_s3(
     fichier_cis: str | None = None,
+    fichier_sortie: str | None = None,
     limite: int | None = None,
     pattern: str = "N",
     batch_size: int = 500,
 ) -> None:
     """
-    Process HTML files from S3 and write results back to S3.
+    Process HTML files from S3 and write results to S3 or locally.
 
     Args:
         fichier_cis: Local file containing authorized CIS codes (if None, uses database)
+        fichier_sortie: Local output JSONL file (if None, writes to S3)
         limite: Limit number of files to process (for testing)
         pattern: File pattern to process ("N" for Notices, "R" for RCP)
         batch_size: Number of files to process per batch (to limit memory usage)
@@ -245,6 +248,12 @@ def traiter_depuis_s3(
     total_files = len(html_keys)
     num_batches = (total_files + batch_size - 1) // batch_size
     logger.info(f"{total_files} files to process in {num_batches} batches of {batch_size}")
+
+    # If writing locally, initialize the output file
+    if fichier_sortie:
+        with open(fichier_sortie, "w", encoding="utf-8") as f_out:
+            pass
+        logger.info(f"Local output: {fichier_sortie}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     total_processed = 0
@@ -326,6 +335,7 @@ Environment variables for database:
     # S3 mode
     s3_parser = subparsers.add_parser("s3", help="Process from S3 (Clever Cloud Cellar)")
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
+    s3_parser.add_argument("--output", "-o", help="Local output JSONL file (default: writes to S3)")
     s3_parser.add_argument("--limite", type=int, help="Limit number of files to process")
     s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
     s3_parser.add_argument("--batch-size", type=int, default=500, help="Files per batch (default: 500)")
@@ -368,6 +378,7 @@ Environment variables for database:
         try:
             traiter_depuis_s3(
                 fichier_cis=args.cis_file,
+                fichier_sortie=args.output,
                 limite=args.limite,
                 pattern=args.pattern,
                 batch_size=args.batch_size,

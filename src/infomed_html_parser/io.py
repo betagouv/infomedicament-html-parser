@@ -7,7 +7,7 @@ def charger_html(fichier_html: str) -> str:
     """Load an HTML file with automatic encoding detection."""
     with open(fichier_html, "rb") as f:
         contenu_binaire = f.read()
-        encodage = chardet.detect(contenu_binaire)["encoding"]
+        encodage = chardet.detect(contenu_binaire)["encoding"] or "utf-8"
     return contenu_binaire.decode(encodage)
 
 
