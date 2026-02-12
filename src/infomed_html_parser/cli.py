@@ -1,6 +1,7 @@
 """Command-line interface for the HTML parser."""
 
 import argparse
+import csv
 import glob
 import json
 import logging
@@ -167,15 +168,17 @@ def traiter_dossier_local(
 
 def traiter_depuis_s3(
     fichier_cis: str | None = None,
+    fichier_sortie: str | None = None,
     limite: int | None = None,
     pattern: str = "N",
     batch_size: int = 500,
 ) -> None:
     """
-    Process HTML files from S3 and write results back to S3.
+    Process HTML files from S3 and write results to S3 or locally.
 
     Args:
         fichier_cis: Local file containing authorized CIS codes (if None, uses database)
+        fichier_sortie: Local output JSONL file (if None, writes to S3)
         limite: Limit number of files to process (for testing)
         pattern: File pattern to process ("N" for Notices, "R" for RCP)
         batch_size: Number of files to process per batch (to limit memory usage)
@@ -246,6 +249,12 @@ def traiter_depuis_s3(
     num_batches = (total_files + batch_size - 1) // batch_size
     logger.info(f"{total_files} files to process in {num_batches} batches of {batch_size}")
 
+    # If writing locally, initialize the output file
+    if fichier_sortie:
+        with open(fichier_sortie, "w", encoding="utf-8") as f_out:
+            pass
+        logger.info(f"Local output: {fichier_sortie}")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     total_processed = 0
     total_skipped = 0
@@ -272,16 +281,149 @@ def traiter_depuis_s3(
                 logger.error(f"Error processing {key}: {e}")
                 total_skipped += 1
 
-        # Write batch results to S3
+        # Write batch results
         if batch_results:
-            output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}_batch{batch_num + 1:03d}.jsonl"
-            output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in batch_results)
-            s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
-            logger.info(f"Batch {batch_num + 1} written to S3: {output_key} ({len(batch_results)} results)")
-
-        # Memory is freed when batch_results goes out of scope
+            if fichier_sortie:
+                with open(fichier_sortie, "a", encoding="utf-8") as f_out:
+                    for r in batch_results:
+                        f_out.write(json.dumps(r, ensure_ascii=False) + "\n")
+                logger.info(f"Batch {batch_num + 1} appended to {fichier_sortie} ({len(batch_results)} results)")
+            else:
+                output_key = f"{config.s3.output_prefix}parsed_{pattern}_{timestamp}_batch{batch_num + 1:03d}.jsonl"
+                output_content = "\n".join(json.dumps(r, ensure_ascii=False) for r in batch_results)
+                s3_client.upload_file_content(output_key, output_content, content_type="application/x-ndjson")
+                logger.info(f"Batch {batch_num + 1} written to S3: {output_key} ({len(batch_results)} results)")
 
     logger.info(f"Processing complete: {total_processed} processed, {total_skipped} skipped")
+
+
+def run_pediatric_classification(
+    rcp_path: str,
+    truth_path: str | None,
+    output_path: str,
+) -> None:
+    """Run pediatric classification on parsed RCPs and optionally evaluate."""
+    from .db import get_cis_atc_mapping
+    from .pediatric import (
+        PediatricClassification,
+        classify,
+        compute_metrics,
+        format_metrics,
+        load_ground_truth,
+    )
+
+    # Load ground truth for evaluation
+    ground_truth = {}
+    if truth_path:
+        ground_truth = load_ground_truth(truth_path)
+        logger.info(f"Ground truth loaded: {len(ground_truth)} entries")
+
+    # Load ATC codes from PostgreSQL
+    atc_mapping = get_cis_atc_mapping()
+    logger.info(f"ATC mapping loaded: {len(atc_mapping)} entries")
+
+    # Index parsed RCPs by CIS code
+    rcp_by_cis: dict[str, dict] = {}
+    with open(rcp_path, encoding="utf-8") as f:
+        for line in f:
+            rcp_json = json.loads(line)
+            source = rcp_json.get("source", {})
+            cis = source.get("cis", "") if isinstance(source, dict) else ""
+            if cis:
+                rcp_by_cis[cis] = rcp_json
+
+    logger.info(f"Loaded {len(rcp_by_cis)} parsed RCPs")
+
+    # Determine which CIS codes to include in output
+    if ground_truth:
+        all_cis = list(ground_truth.keys())
+    else:
+        all_cis = list(rcp_by_cis.keys())
+
+    # Classify each CIS
+    predictions: list[PediatricClassification | None] = []
+    missing_rcp = 0
+    for cis in all_cis:
+        rcp_json = rcp_by_cis.get(cis)
+        if rcp_json:
+            atc_code = atc_mapping.get(cis, "")
+            predictions.append(classify(rcp_json, atc_code=atc_code))
+        else:
+            predictions.append(None)
+            missing_rcp += 1
+
+    logger.info(f"Classified {len(all_cis) - missing_rcp} drugs, {missing_rcp} missing RCP")
+
+    # Write predictions CSV
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        header = ["cis", "pred_A", "pred_B", "pred_C"]
+        if ground_truth:
+            header += ["truth_A", "truth_B", "truth_C", "match_A", "match_B", "match_C"]
+        header += ["c_reasons", "keywords_41_42", "keywords_43", "evidence_41_42", "evidence_43"]
+        writer.writerow(header)
+
+        for cis, pred in zip(all_cis, predictions):
+            gt = ground_truth.get(cis, {})
+
+            if pred is None:
+                # No parsed RCP available
+                row = [cis, "", "", ""]
+                if ground_truth:
+                    truth_a = gt.get("A", "")
+                    truth_b = gt.get("B", "")
+                    truth_c = gt.get("C", "")
+                    row += [
+                        int(truth_a) if isinstance(truth_a, bool) else "",
+                        int(truth_b) if isinstance(truth_b, bool) else "",
+                        int(truth_c) if isinstance(truth_c, bool) else "",
+                        "", "", "",
+                    ]
+                row += ["RCP manquant", "", "", "", ""]
+                writer.writerow(row)
+                continue
+
+            row = [
+                pred.cis,
+                int(pred.condition_a),
+                int(pred.condition_b),
+                int(pred.condition_c),
+            ]
+            if ground_truth:
+                truth_a = gt.get("A", "")
+                truth_b = gt.get("B", "")
+                truth_c = gt.get("C", "")
+                row += [
+                    int(truth_a) if isinstance(truth_a, bool) else "",
+                    int(truth_b) if isinstance(truth_b, bool) else "",
+                    int(truth_c) if isinstance(truth_c, bool) else "",
+                    int(pred.condition_a == truth_a) if isinstance(truth_a, bool) else "",
+                    int(pred.condition_b == truth_b) if isinstance(truth_b, bool) else "",
+                    int(pred.condition_c == truth_c) if isinstance(truth_c, bool) else "",
+                ]
+            # Explainability columns
+            kw_41_42 = []
+            for m in pred.matches_41_42:
+                kw_41_42.extend(m.keywords)
+            kw_43 = []
+            for m in pred.matches_43:
+                kw_43.extend(m.keywords)
+            row += [
+                " | ".join(pred.c_reasons),
+                " | ".join(dict.fromkeys(kw_41_42)),
+                " | ".join(dict.fromkeys(kw_43)),
+                " ||| ".join(m.text[:200] for m in pred.matches_41_42),
+                " ||| ".join(m.text[:200] for m in pred.matches_43),
+            ]
+            writer.writerow(row)
+
+    logger.info(f"Predictions written to {output_path}")
+
+    # Evaluate if ground truth provided
+    if ground_truth:
+        classified = [p for p in predictions if p is not None]
+        metrics = compute_metrics(classified, ground_truth)
+        print(format_metrics(metrics))
 
 
 def main():
@@ -326,6 +468,7 @@ Environment variables for database:
     # S3 mode
     s3_parser = subparsers.add_parser("s3", help="Process from S3 (Clever Cloud Cellar)")
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
+    s3_parser.add_argument("--output", "-o", help="Local output JSONL file (default: writes to S3)")
     s3_parser.add_argument("--limite", type=int, help="Limit number of files to process")
     s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
     s3_parser.add_argument("--batch-size", type=int, default=500, help="Files per batch (default: 500)")
@@ -336,6 +479,12 @@ Environment variables for database:
     sql_parser.add_argument("--output", "-o", help="Output CSV file (default: same name with .csv)")
     sql_parser.add_argument("--encoding", "-e", default="iso-8859-1", help="Source file encoding")
     sql_parser.add_argument("--dialect", "-d", default="tsql", help="SQL dialect (tsql, mysql, postgres)")
+
+    # Pediatric classification mode
+    ped_parser = subparsers.add_parser("classify-pediatric", help="Classify drugs for pediatric use")
+    ped_parser.add_argument("--rcp", required=True, help="Parsed RCP JSONL file")
+    ped_parser.add_argument("--truth", help="Ground truth CSV (for evaluation)")
+    ped_parser.add_argument("--output", "-o", default="data/predictions.csv", help="Output predictions CSV")
 
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -368,6 +517,7 @@ Environment variables for database:
         try:
             traiter_depuis_s3(
                 fichier_cis=args.cis_file,
+                fichier_sortie=args.output,
                 limite=args.limite,
                 pattern=args.pattern,
                 batch_size=args.batch_size,
@@ -380,6 +530,13 @@ Environment variables for database:
         try:
             output_path = Path(args.output) if args.output else None
             sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "classify-pediatric":
+        try:
+            run_pediatric_classification(args.rcp, args.truth, args.output)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
