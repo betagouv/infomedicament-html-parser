@@ -5,6 +5,23 @@ import re
 from bs4 import BeautifulSoup
 
 
+def normaliser_texte(texte: str) -> str:
+    """Normalize Unicode characters in extracted text.
+
+    Replaces curly quotes, non-breaking hyphens, and en-dashes so downstream
+    regex matching works consistently.
+    """
+    return (
+        texte
+        .replace("\u2019", "'")   # right single quotation mark
+        .replace("\u2018", "'")   # left single quotation mark
+        .replace("\u2011", "-")   # non-breaking hyphen
+        .replace("\u2013", "-")   # en dash
+        .replace("\u2265", ">=")  # change ≥ to >=
+        .replace("\u2264", "<=")  # change ≤ to <=
+    )
+
+
 def traiter_images_dans_html(contenu_html):
     """
     Process img tags in HTML content by converting relative URLs to absolute URLs
@@ -226,7 +243,7 @@ def extraire_contenu_cellule(cellule):
     contenu = {
         "tag": cellule.name,
         "attributes": extraire_attributs_html(cellule),
-        "text": nettoyer_element_pour_texte(cellule).get_text(),
+        "text": normaliser_texte(nettoyer_element_pour_texte(cellule).get_text()),
         "html": cellule_html_traite,  # Add complete HTML with images
         "children": [],
     }
@@ -238,7 +255,7 @@ def extraire_contenu_cellule(cellule):
     for enfant in cellule.children:
         if hasattr(enfant, "name") and enfant.name:
             if enfant.name in ["p", "div", "span"]:
-                enfant_text = nettoyer_element_pour_texte(enfant).get_text()
+                enfant_text = normaliser_texte(nettoyer_element_pour_texte(enfant).get_text())
                 # ONLY add child if its text differs from parent
                 # or if it has specific styles
                 enfant_styles = extraire_styles(enfant)
@@ -391,7 +408,7 @@ def html_vers_json(contenu_html):
 
         classe = classes[0]
         # Use cleaned version to extract text
-        texte = nettoyer_element_pour_texte(element).get_text()
+        texte = normaliser_texte(nettoyer_element_pour_texte(element).get_text())
 
         ancre = None
         a_tag = element.find("a")
@@ -421,7 +438,7 @@ def html_vers_json(contenu_html):
             while i < len(elements) and elements[i].get("class", [None])[0] == classe:
                 # Check that element is not inside a table
                 if not est_dans_table(elements[i]):
-                    puce_texte = nettoyer_element_pour_texte(elements[i]).get_text()
+                    puce_texte = normaliser_texte(nettoyer_element_pour_texte(elements[i]).get_text())
                     if puce_texte:
                         puces.append(puce_texte)
                     elements_traites.add(id(elements[i]))
