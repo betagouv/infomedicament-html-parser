@@ -278,6 +278,11 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
         result.b_reasons.append("mention pédiatrique en 4.3")
     result.condition_b = len(result.matches_43) > 0
 
+    # C is mutually exclusive with A and B: C takes priority
+    if result.condition_c:
+        result.condition_a = False
+        result.condition_b = False
+
     return result
 
 

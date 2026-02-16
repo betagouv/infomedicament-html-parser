@@ -148,6 +148,23 @@ class TestClassify:
         assert "keyword positif en 4.1/4.2" in result.a_reasons
         assert "mention pédiatrique en 4.3" in result.b_reasons
 
+    def test_c_overrides_a_and_b(self, make_rcp):
+        """C is mutually exclusive with A and B: C takes priority."""
+        rcp = make_rcp(sections={
+            "4.1": [
+                "Indiqué chez l'enfant de plus de 6 ans",
+                "La sécurité et l'efficacité n'ont pas été étudiées chez les enfants",
+            ],
+            "4.3": ["Contre-indiqué chez le nourrisson"],
+        })
+        result = classify(rcp)
+        assert result.condition_c is True
+        assert result.condition_a is False
+        assert result.condition_b is False
+        # But reasons/matches are still populated for traceability
+        assert "keyword positif en 4.1/4.2" in result.a_reasons
+        assert "mention pédiatrique en 4.3" in result.b_reasons
+
     def test_empty_rcp(self, make_rcp):
         """Empty RCP → C=True (no keywords)."""
         rcp = make_rcp(sections={})
