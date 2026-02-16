@@ -301,6 +301,7 @@ def run_pediatric_classification(
     rcp_path: str,
     truth_path: str | None,
     output_path: str,
+    debug: bool = False,
 ) -> None:
     """Run pediatric classification on parsed RCPs and optionally evaluate."""
     from .db import get_cis_atc_mapping
@@ -308,6 +309,7 @@ def run_pediatric_classification(
         PediatricClassification,
         classify,
         compute_metrics,
+        extract_section_texts,
         format_metrics,
         load_ground_truth,
     )
@@ -354,13 +356,31 @@ def run_pediatric_classification(
 
     logger.info(f"Classified {len(all_cis) - missing_rcp} drugs, {missing_rcp} missing RCP")
 
+    # Write debug sections file
+    if debug:
+        debug_path = os.path.join(os.path.dirname(output_path) or ".", "debug_sections.jsonl")
+        with open(debug_path, "w", encoding="utf-8") as f_debug:
+            for cis in all_cis:
+                rcp_json = rcp_by_cis.get(cis)
+                if not rcp_json:
+                    continue
+                entry = {
+                    "cis": cis,
+                    "atc_code": atc_mapping.get(cis, ""),
+                    "raw_41": "\n".join(extract_section_texts(rcp_json, "4.1")),
+                    "raw_42": "\n".join(extract_section_texts(rcp_json, "4.2")),
+                    "raw_43": "\n".join(extract_section_texts(rcp_json, "4.3")),
+                }
+                f_debug.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logger.info(f"Debug sections written to {debug_path}")
+
     # Write predictions CSV
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         header = ["cis", "pred_A", "pred_B", "pred_C"]
         if ground_truth:
             header += ["truth_A", "truth_B", "truth_C", "match_A", "match_B", "match_C"]
-        header += ["c_reasons", "keywords_41_42", "keywords_43", "evidence_41_42", "evidence_43"]
+        header += ["a_reasons", "b_reasons", "c_reasons", "keywords_41_42", "keywords_43", "evidence_41_42", "evidence_43"]
         writer.writerow(header)
 
         for cis, pred in zip(all_cis, predictions):
@@ -379,7 +399,7 @@ def run_pediatric_classification(
                         int(truth_c) if isinstance(truth_c, bool) else "",
                         "", "", "",
                     ]
-                row += ["RCP manquant", "", "", "", ""]
+                row += ["", "", "RCP manquant", "", "", "", ""]
                 writer.writerow(row)
                 continue
 
@@ -409,6 +429,8 @@ def run_pediatric_classification(
             for m in pred.matches_43:
                 kw_43.extend(m.keywords)
             row += [
+                " | ".join(pred.a_reasons),
+                " | ".join(pred.b_reasons),
                 " | ".join(pred.c_reasons),
                 " | ".join(dict.fromkeys(kw_41_42)),
                 " | ".join(dict.fromkeys(kw_43)),
@@ -485,6 +507,7 @@ Environment variables for database:
     ped_parser.add_argument("--rcp", required=True, help="Parsed RCP JSONL file")
     ped_parser.add_argument("--truth", help="Ground truth CSV (for evaluation)")
     ped_parser.add_argument("--output", "-o", default="data/predictions.csv", help="Output predictions CSV")
+    ped_parser.add_argument("--debug", action="store_true", help="Write debug_sections.jsonl with raw section texts")
 
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -536,7 +559,7 @@ Environment variables for database:
 
     elif args.command == "classify-pediatric":
         try:
-            run_pediatric_classification(args.rcp, args.truth, args.output)
+            run_pediatric_classification(args.rcp, args.truth, args.output, debug=args.debug)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)

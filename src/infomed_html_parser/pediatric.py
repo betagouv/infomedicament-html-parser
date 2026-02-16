@@ -194,6 +194,8 @@ class PediatricClassification:
     condition_a: bool = False
     condition_b: bool = False
     condition_c: bool = False
+    a_reasons: list[str] = field(default_factory=list)
+    b_reasons: list[str] = field(default_factory=list)
     c_reasons: list[str] = field(default_factory=list)
     matches_41_42: list[SentenceMatch] = field(default_factory=list)
     matches_43: list[SentenceMatch] = field(default_factory=list)
@@ -250,6 +252,8 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
     is_contraceptive = bool(atc_code and atc_code.upper().startswith("G03"))
 
     # A: Indication pédiatrique
+    if has_positive:
+        result.a_reasons.append("keyword positif en 4.1/4.2")
     result.condition_a = has_positive
 
     # C: Sur avis d'un professionnel de santé
@@ -270,6 +274,8 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
         if keywords:
             result.matches_43.append(SentenceMatch(text=text, keywords=keywords))
 
+    if result.matches_43:
+        result.b_reasons.append("mention pédiatrique en 4.3")
     result.condition_b = len(result.matches_43) > 0
 
     return result

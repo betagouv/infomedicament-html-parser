@@ -85,6 +85,7 @@ class TestClassify:
         result = classify(rcp)
         assert result.condition_a is True
         assert len(result.matches_41_42) > 0
+        assert "keyword positif en 4.1/4.2" in result.a_reasons
 
     def test_negative_pattern_gives_c(self, make_rcp):
         """Keyword + negative pattern in 4.2 → C=True, A=False."""
@@ -93,6 +94,7 @@ class TestClassify:
         })
         result = classify(rcp)
         assert result.condition_a is False
+        assert result.a_reasons == []
         assert result.condition_c is True
 
     def test_no_keyword_gives_c(self, make_rcp):
@@ -114,6 +116,7 @@ class TestClassify:
         result = classify(rcp)
         assert result.condition_b is True
         assert len(result.matches_43) > 0
+        assert "mention pédiatrique en 4.3" in result.b_reasons
 
     def test_adult_reserved(self, make_rcp):
         """'réservé à l'adulte' in 4.1 → C=True."""
@@ -142,6 +145,8 @@ class TestClassify:
         result = classify(rcp)
         assert result.condition_a is True
         assert result.condition_b is True
+        assert "keyword positif en 4.1/4.2" in result.a_reasons
+        assert "mention pédiatrique en 4.3" in result.b_reasons
 
     def test_empty_rcp(self, make_rcp):
         """Empty RCP → C=True (no keywords)."""
@@ -150,6 +155,8 @@ class TestClassify:
         assert result.condition_a is False
         assert result.condition_b is False
         assert result.condition_c is True
+        assert result.a_reasons == []
+        assert result.b_reasons == []
 
 
 # extract_section_texts tests
