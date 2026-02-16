@@ -30,13 +30,13 @@ PEDIATRIC_KEYWORDS = [
 
 # Patterns for age/weight mentions (< 18 years)
 PEDIATRIC_AGE_PATTERNS = [
-    # Age in years (0-17 ans): "âgé de moins de 12 ans", "< 6 ans", etc.
-    r'\b(?:âgée?s?|age|âge)\s*(?:de\s*)?(?:moins\s*de\s*|<\s*|inférieure?\s*à\s*)?(?:1[0-7]|[0-9])\s*ans?\b',
+    # Age in years (0-18 ans): "âgé de moins de 12 ans", "< 6 ans", etc.
+    r'\b(?:âgée?s?|age|âge)\s*(?:de\s*)?(?:moins\s*de\s*|<\s*|inférieure?\s*à\s*)?(?:1[0-8]|[0-9])\s*ans?\b',
     # Age in months/days: any number is pediatric — "18 mois", "24 mois", "28 jours"
     r'\b(?:âgée?s?|age|âge)\s*(?:de\s*)?(?:moins\s*de\s*|<\s*|inférieure?\s*à\s*)?(?:[0-9]+)\s*(?:mois|jours?)\b',
     # "plus de 15 ans", "à partir de 16 ans" (age-bounded indications)
-    r'\bplus\s*de\s*(?:1[0-7]|[0-9])\s*ans\b',
-    r'\bà\s*partir\s*de\s*(?:1[0-7]|[0-9])\s*ans\b',
+    r'\bplus\s*de\s*(?:1[0-8]|[0-9])\s*ans\b',
+    r'\bà\s*partir\s*de\s*(?:1[0-8]|[0-9])\s*ans\b',
     # "poids < 30 kg", "pesant moins de 15 kg"
     r'\b(?:poids|pesant)\s*(?:de\s*)?(?:moins\s*de\s*|<\s*|inférieure?\s*à\s*)?(?:[0-9]+(?:[.,][0-9]+)?)\s*kg\b',
 ]
