@@ -41,6 +41,12 @@ PEDIATRIC_AGE_PATTERNS = [
     r'\b(?:poids|pesant)\s*(?:de\s*)?(?:moins\s*de\s*|[<>]=?\s*|inférieure?\s*à\s*|supérieure?\s*à\s*)?(?:[0-9]+(?:[.,][0-9]+)?)\s*kg\b',
 ]
 
+# --- Positive indication patterns (required for A) ---
+
+POSITIVE_INDICATION_PATTERNS = [
+    r"(?:est|sont)\s+indiquée?s?",
+]
+
 # --- Negative phrase patterns (lead to C: "Sur avis") ---
 
 NEGATIVE_PATTERNS = [
@@ -172,6 +178,12 @@ def matches_negative_pattern(text: str) -> str | None:
     return None
 
 
+def matches_positive_indication(text: str) -> bool:
+    """Check if text contains an explicit indication phrase like 'est indiqué'."""
+    text_lower = text.lower()
+    return any(re.search(p, text_lower) for p in POSITIVE_INDICATION_PATTERNS)
+
+
 def is_adult_reserved(text: str) -> bool:
     """Check if text contains a 'réservé à l'adulte' phrase."""
     text_lower = text.lower()
@@ -223,6 +235,7 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
     has_any_keyword = False
     has_positive = False
     has_negative = False
+    has_keyword_no_indication = False
 
     for text in texts_41_42:
         keywords = find_pediatric_keywords_in_text(text)
@@ -237,12 +250,15 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
             result.matches_41_42.append(
                 SentenceMatch(text=text, keywords=keywords, negative_pattern=neg)
             )
-        else:
-            # Keyword present without negative qualifier → positive indication
+        elif matches_positive_indication(text):
+            # Keyword + explicit indication phrase → positive indication
             has_positive = True
             result.matches_41_42.append(
                 SentenceMatch(text=text, keywords=keywords, is_positive=True)
             )
+        else:
+            # Keyword present but no indication phrase → not a clear indication
+            has_keyword_no_indication = True
 
     # "réservé à l'adulte" check on full 4.1/4.2 text
     full_text_41_42 = " ".join(texts_41_42)
@@ -259,6 +275,8 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
     # C: Sur avis d'un professionnel de santé
     if has_negative:
         result.c_reasons.append("phrases négatives en 4.1/4.2")
+    if has_keyword_no_indication and not has_positive:
+        result.c_reasons.append("keyword sans indication explicite en 4.1/4.2")
     if not has_any_keyword:
         result.c_reasons.append("pas de mention pédiatrique en 4.1/4.2")
     if adult_reserved:

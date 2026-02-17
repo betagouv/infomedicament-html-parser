@@ -97,6 +97,16 @@ class TestClassify:
         assert result.a_reasons == []
         assert result.condition_c is True
 
+    def test_keyword_without_indication_gives_c(self, make_rcp):
+        """Keyword present but no indication phrase → C=True, A=False."""
+        rcp = make_rcp(sections={
+            "4.1": ["Posologie chez l'enfant de plus de 6 ans : 10 mg/jour"],
+        })
+        result = classify(rcp)
+        assert result.condition_a is False
+        assert result.condition_c is True
+        assert "keyword sans indication explicite en 4.1/4.2" in result.c_reasons
+
     def test_no_keyword_gives_c(self, make_rcp):
         """No pediatric keyword at all → C=True."""
         rcp = make_rcp(sections={
@@ -139,7 +149,7 @@ class TestClassify:
     def test_a_and_b_together(self, make_rcp):
         """Indication in 4.1 + contraindication in 4.3 → A=True and B=True."""
         rcp = make_rcp(sections={
-            "4.1": ["Indiqué chez l'enfant de plus de 6 ans"],
+            "4.1": ["Ce médicament est indiqué chez l'enfant de plus de 6 ans"],
             "4.3": ["Contre-indiqué chez l'enfant de moins de 6 ans"],
         })
         result = classify(rcp)
@@ -152,7 +162,7 @@ class TestClassify:
         """C overrides A, but B overrides C."""
         rcp = make_rcp(sections={
             "4.1": [
-                "Indiqué chez l'enfant de plus de 6 ans",
+                "Ce médicament est indiqué chez l'enfant de plus de 6 ans",
                 "La sécurité et l'efficacité n'ont pas été étudiées chez les enfants",
             ],
             "4.3": ["Contre-indiqué chez le nourrisson"],
