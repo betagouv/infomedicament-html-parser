@@ -83,7 +83,8 @@ The database is used for two purposes:
 Two configuration formats are supported:
 
 **Option 1: Connection URL (recommended for Scalingo)**
-- `DATABASE_URL` or `SCALINGO_MYSQL_URL`: Full connection string (e.g., `mysql://user:pass@host:port/database`)
+- `DATABASE_URL` or `SCALINGO_MYSQL_URL`: Full connection string for mySQL
+- `POSTGRES_URL` or `APP_DATABASE_URL`: Full connection string for PostgreSQL
 
 **Option 2: Individual variables (for local development)**
 - `MYSQL_HOST` (default: localhost)
@@ -91,6 +92,11 @@ Two configuration formats are supported:
 - `MYSQL_PASSWORD` (default: mysql)
 - `MYSQL_DATABASE` (default: pdbm_bdd)
 - `MYSQL_PORT` (default: 3306)
+- `POSTGRES_HOST` (default: localhost)
+- `POSTGRES_USER` (default: postgres)
+- `POSTGRES_PASSWORD` (default: postgres)
+- `POSTGRES_DATABASE` (default: postgres)
+- `POSTGRES_PORT` (default: 5432)
 
 ### Application Configuration
 
@@ -133,6 +139,36 @@ Set these in your Scalingo app settings:
 
 - `S3_KEY_ID` and `S3_KEY_SECRET` (from Clever Cloud Cellar addon)
 - `DATABASE_URL`: Copy the MySQL connection string from the app containing the database addon
+
+## DB Import
+
+Import parsed JSONL files from S3 into PostgreSQL. This replaces the legacy TypeScript `importNoticeRCP.ts` script.
+
+```bash
+poetry run infomed-html-parser db-import --pattern <N|R> [options]
+```
+
+Options:
+- `--pattern`: N=Notices, R=RCPs (required)
+- `--limite`: Limit number of records to import (for testing)
+
+Example:
+```bash
+# Import all RCP records
+poetry run infomed-html-parser db-import --pattern R
+
+# Test with 10 records
+poetry run infomed-html-parser db-import --pattern N --limite 10
+```
+
+The command lists all `parsed_<pattern>_*.jsonl` files under `S3_OUTPUT_PREFIX`, downloads each one, and upserts the records into PostgreSQL (by `codeCIS`). Existing content trees are deleted before re-inserting.
+
+### Scalingo
+
+```bash
+scalingo --app your-app run "python -m infomed_html_parser.cli db-import --pattern N"
+scalingo --app your-app run "python -m infomed_html_parser.cli db-import --pattern R"
+```
 
 ## SQL to CSV Conversion
 

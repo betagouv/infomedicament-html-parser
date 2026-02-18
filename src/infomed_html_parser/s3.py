@@ -91,6 +91,25 @@ class S3Client:
         )
         logger.info(f"Uploaded {key} to S3")
 
+    def list_parsed_files(self, pattern: str) -> Iterator[str]:
+        """
+        List parsed JSONL files in the output prefix matching the pattern.
+
+        Args:
+            pattern: "N" for Notice files, "R" for RCP files
+
+        Yields:
+            Object keys for matching JSONL files
+        """
+        prefix = self.config.output_prefix
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                filename = key.split("/")[-1]
+                if filename.startswith(f"parsed_{pattern}_") and filename.endswith(".jsonl"):
+                    yield key
+
     def get_filename_from_key(self, key: str) -> str:
         """Extract the filename from an S3 key."""
         return key.split("/")[-1]

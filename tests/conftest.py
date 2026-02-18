@@ -7,6 +7,25 @@ import pytest
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+class FakeCursor:
+    """Minimal fake psycopg2 cursor for testing."""
+
+    def __init__(self, ids=()):
+        self._ids = iter(ids)
+        self.execute_calls = []
+
+    def execute(self, _sql, params=None):
+        self.execute_calls.append(params)
+
+    def fetchone(self):
+        return (next(self._ids),)
+
+
+@pytest.fixture
+def fake_cursor():
+    return FakeCursor
+
+
 @pytest.fixture
 def sample_notice_html() -> str:
     """Load sample Notice HTML file."""
