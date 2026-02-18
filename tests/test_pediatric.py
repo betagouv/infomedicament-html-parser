@@ -97,8 +97,9 @@ class TestClassify:
         assert result.a_reasons == []
         assert result.condition_c is True
 
-    def test_keyword_without_indication_gives_c(self, make_rcp):
+    def test_keyword_without_indication_gives_c(self, make_rcp, monkeypatch):
         """Keyword present but no indication phrase → C=True, A=False."""
+        monkeypatch.setattr("infomed_html_parser.pediatric_config.REQUIRE_POSITIVE_INDICATION", True)
         rcp = make_rcp(sections={
             "4.1": ["Posologie chez l'enfant de plus de 6 ans : 10 mg/jour"],
         })
@@ -158,8 +159,9 @@ class TestClassify:
         assert "keyword positif en 4.1/4.2" in result.a_reasons
         assert "mention pédiatrique en 4.3" in result.b_reasons
 
-    def test_c_overrides_a(self, make_rcp):
+    def test_c_overrides_a(self, make_rcp, monkeypatch):
         """C overrides A, but B overrides C."""
+        monkeypatch.setattr("infomed_html_parser.pediatric_config.TIE_BREAKER_PRIORITY", {"AC": "C", "BC": "B", "ABC": "B"})
         rcp = make_rcp(sections={
             "4.1": [
                 "Ce médicament est indiqué chez l'enfant de plus de 6 ans",

@@ -14,75 +14,7 @@ import csv
 import re
 from dataclasses import dataclass, field
 
-
-# --- Keywords ---
-
-PEDIATRIC_KEYWORDS = [
-    "pédiatrie", "pédiatrique", "enfant", "enfants",
-    "nourrisson", "nourrissons",
-    "nouveau-né", "nouveau-nés", "nouveaux-nés",
-    "prématuré", "prématurés",
-    "infantile",
-    "adolescent", "adolescents", "adolescente", "adolescentes",
-    "juvénile", "juvéniles",
-    "immature",
-]
-
-# Patterns for age/weight mentions (< 18 years)
-PEDIATRIC_AGE_PATTERNS = [
-    # Age in years (0-18 ans): "âgé de moins de 12 ans", "< 6 ans", ">= 6 ans", etc.
-    r'\b(?:âgée?s?|age|âge)\s*(?:de\s*)?(?:moins\s*de\s*|[<>]=?\s*|inférieure?\s*à\s*|supérieure?\s*à\s*)?(?:1[0-8]|[0-9])\s*ans?\b',
-    # Age in months/days: any number is pediatric — "18 mois", "24 mois", "28 jours"
-    r'\b(?:âgée?s?|age|âge)\s*(?:de\s*)?(?:moins\s*de\s*|[<>]=?\s*|inférieure?\s*à\s*|supérieure?\s*à\s*)?(?:[0-9]+)\s*(?:mois|jours?)\b',
-    # "plus de 15 ans", "à partir de 16 ans" (age-bounded indications)
-    r'\bplus\s*de\s*(?:1[0-7]|[0-9])\s*ans\b',
-    r'\bà\s*partir\s*de\s*(?:1[0-7]|[0-9])\s*ans\b',
-    # "poids < 30 kg", "poids >= 40 kg", "pesant moins de 15 kg"
-    r'\b(?:poids|pesant)\s*(?:de\s*)?(?:moins\s*de\s*|[<>]=?\s*|inférieure?\s*à\s*|supérieure?\s*à\s*)?(?:[0-9]+(?:[.,][0-9]+)?)\s*kg\b',
-]
-
-# --- Positive indication patterns (required for A) ---
-
-POSITIVE_INDICATION_PATTERNS = [
-    r"(?:est|sont)\s+indiquée?s?",
-]
-
-# --- Negative phrase patterns (lead to C: "Sur avis") ---
-
-NEGATIVE_PATTERNS = [
-    r"ne doit pas être utilisée?",
-    r"ne doivent pas être utilisée?s?",
-    r"n'est pas indiquée?",
-    r"ne sont pas indiquée?s?",
-    r"n'est pas recommandée?",
-    r"ne sont pas recommandée?s?",
-    r"pas recommandable",
-    r"sécurité.*?efficacité.*?n'ont pas été",
-    r"sécurité.*?efficacité.*?n'a pas été",
-    r"sécurité.*?efficacité.*?n'a\s*/\s*n'ont pas été",
-    r"tolérance.*?efficacité.*?n'ont pas été",
-    r"tolérance.*?efficacité.*?n'a pas été",
-    r"n'a pas été suffisamment démontrée?",
-    r"n'a pas été étudiée?",
-    r"n'est pas justifiée?",
-    r"il n'existe pas d'utilisation justifiée?",
-    r"est déconseillée?",
-    r"aucune donnée.*?disponible",
-    r"aucune étude.*?effectuée",
-    r"données disponibles sont limitées",
-    r"peu de données",
-    r"pas possible de recommander",
-    r"en l'absence de données?",
-    r"absence d'expérience",
-    r"sans objet",
-]
-
-ADULT_RESERVED_PATTERNS = [
-    r"réservée?s?\s+à\s+l'adulte",
-    r"réservée?s?\s+à\s+l\s+adulte",
-    r"reservée?s?\s+a\s+l'adulte",
-]
-
+from infomed_html_parser import pediatric_config
 
 # --- Section extraction ---
 
@@ -110,16 +42,6 @@ def extract_section_texts(rcp_json: dict, section_prefix: str) -> list[str]:
     return texts
 
 
-# Subsection titles that are headings but not specific content to match
-_HEADING_ONLY_TITLES = {
-    "population pédiatrique",
-    "populations particulières",
-    "posologie",
-    "mode d'administration",
-    "durée du traitement",
-}
-
-
 def _collect_texts(node: dict, texts: list[str]) -> None:
     """Recursively collect text content from a JSON node."""
     content = node.get("content", "")
@@ -132,7 +54,7 @@ def _collect_texts(node: dict, texts: list[str]) -> None:
         # Include subsection titles only if they carry clinical info
         # (e.g. "Réservé au nourrisson et à l'enfant de plus de 3 mois")
         # Skip generic structural headings
-        if isinstance(content, str) and content.strip().lower() not in _HEADING_ONLY_TITLES:
+        if isinstance(content, str) and content.strip().lower() not in pediatric_config._HEADING_ONLY_TITLES:
             texts.append(content.strip())
     elif isinstance(content, str) and content.strip():
         texts.append(content.strip())
@@ -155,11 +77,11 @@ def find_pediatric_keywords_in_text(text: str) -> list[str]:
     text_lower = text.lower()
     found = []
 
-    for kw in PEDIATRIC_KEYWORDS:
+    for kw in pediatric_config.PEDIATRIC_KEYWORDS:
         if kw in text_lower:
             found.append(kw)
 
-    for pattern in PEDIATRIC_AGE_PATTERNS:
+    for pattern in pediatric_config.PEDIATRIC_AGE_PATTERNS:
         for match in re.finditer(pattern, text_lower, re.IGNORECASE):
             found.append(match.group())
 
@@ -172,7 +94,7 @@ def matches_negative_pattern(text: str) -> str | None:
     Returns the matched pattern string, or None.
     """
     text_lower = text.lower()
-    for pattern in NEGATIVE_PATTERNS:
+    for pattern in pediatric_config.NEGATIVE_PATTERNS:
         if re.search(pattern, text_lower):
             return pattern
     return None
@@ -181,13 +103,13 @@ def matches_negative_pattern(text: str) -> str | None:
 def matches_positive_indication(text: str) -> bool:
     """Check if text contains an explicit indication phrase like 'est indiqué'."""
     text_lower = text.lower()
-    return any(re.search(p, text_lower) for p in POSITIVE_INDICATION_PATTERNS)
+    return any(re.search(p, text_lower) for p in pediatric_config.POSITIVE_INDICATION_PATTERNS)
 
 
 def is_adult_reserved(text: str) -> bool:
     """Check if text contains a 'réservé à l'adulte' phrase."""
     text_lower = text.lower()
-    return any(re.search(p, text_lower) for p in ADULT_RESERVED_PATTERNS)
+    return any(re.search(p, text_lower) for p in pediatric_config.ADULT_RESERVED_PATTERNS)
 
 
 @dataclass
@@ -250,15 +172,21 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
             result.matches_41_42.append(
                 SentenceMatch(text=text, keywords=keywords, negative_pattern=neg)
             )
-        elif matches_positive_indication(text):
-            # Keyword + explicit indication phrase → positive indication
+        elif pediatric_config.REQUIRE_POSITIVE_INDICATION:
+            # Strict mode: need an explicit indication phrase
+            if matches_positive_indication(text):
+                has_positive = True
+                result.matches_41_42.append(
+                    SentenceMatch(text=text, keywords=keywords, is_positive=True)
+                )
+            else:
+                has_keyword_no_indication = True
+        else:
+            # Permissive mode: keyword without negative → positive
             has_positive = True
             result.matches_41_42.append(
                 SentenceMatch(text=text, keywords=keywords, is_positive=True)
             )
-        else:
-            # Keyword present but no indication phrase → not a clear indication
-            has_keyword_no_indication = True
 
     # "réservé à l'adulte" check on full 4.1/4.2 text
     full_text_41_42 = " ".join(texts_41_42)
@@ -296,13 +224,16 @@ def classify(rcp_json: dict, atc_code: str = "") -> PediatricClassification:
         result.b_reasons.append("mention pédiatrique en 4.3")
     result.condition_b = len(result.matches_43) > 0
 
-    # C is mutually exclusive with A : C takes priority
-    if result.condition_c:
-        result.condition_a = False
-
-    # C is mutually exclusive with B : B takes priority
-    if result.condition_b:
-        result.condition_c = False
+    if tbp:=pediatric_config.TIE_BREAKER_PRIORITY:
+        prediction = ""
+        prediction += "A" if result.condition_a else ""
+        prediction += "B" if result.condition_b else ""
+        prediction += "C" if result.condition_c else ""
+        if len(prediction)>=2:
+            override = tbp[prediction]
+            result.condition_a = "A" in override
+            result.condition_b = "B" in override
+            result.condition_c = "C" in override
 
     return result
 
