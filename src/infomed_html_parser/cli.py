@@ -14,7 +14,7 @@ import chardet
 from tqdm import tqdm
 
 from .config import get_config
-from .db import get_authorized_cis, get_filename_to_cis_mapping
+from .db import get_authorized_cis, get_filename_to_cis_mapping, import_to_postgres
 from .io import charger_liste_cis
 from .parser import html_vers_json
 from .s3 import S3Client
@@ -448,6 +448,60 @@ def run_pediatric_classification(
         print(format_metrics(metrics))
 
 
+def db_import(pattern: str, limite: int | None = None) -> None:
+    """
+    Import parsed JSONL files from S3 into PostgreSQL.
+
+    Args:
+        pattern: "N" for Notices, "R" for RCP.
+        limite: Limit total number of records imported (for testing).
+    """
+    config = get_config()
+
+    if not config.s3.is_configured():
+        raise RuntimeError("S3 credentials not configured. Set S3_KEY_ID and S3_KEY_SECRET.")
+
+    s3_client = S3Client(config.s3)
+    main_table = "notices" if pattern == "N" else "rcp"
+    content_table = "notices_content" if pattern == "N" else "rcp_content"
+
+    logger.info(f"Listing parsed JSONL files for pattern '{pattern}' from S3...")
+    jsonl_keys = list(s3_client.list_parsed_files(pattern))
+    logger.info(f"Found {len(jsonl_keys)} files to import into '{main_table}'")
+
+    total_imported = 0
+    total_errors = 0
+
+    for key in tqdm(jsonl_keys, desc="Files", unit="file"):
+        content = s3_client.download_file_content(key)
+        lines = [line for line in content.decode("utf-8").split("\n") if line.strip()]
+
+        if limite is not None:
+            remaining = limite - total_imported
+            if remaining <= 0:
+                break
+            lines = lines[:remaining]
+
+        records = []
+        parse_errors = 0
+        for line_num, line in enumerate(lines, start=1):
+            try:
+                records.append(json.loads(line))
+            except Exception as e:
+                logger.error(f"Failed to parse line {line_num} in {key}: {e}")
+                parse_errors += 1
+
+        imported, db_errors = import_to_postgres(
+            tqdm(records, desc="records", unit="rec", leave=False),
+            main_table, content_table, config.postgres,
+        )
+        total_imported += imported
+        total_errors += parse_errors + db_errors
+        logger.info(f"{key}: {imported} imported, {parse_errors + db_errors} errors")
+
+    logger.info(f"Import complete: {total_imported} records imported, {total_errors} errors")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Parse ANSM medication HTML documents (Notices and RCPs)",
@@ -502,6 +556,11 @@ Environment variables for database:
     sql_parser.add_argument("--encoding", "-e", default="iso-8859-1", help="Source file encoding")
     sql_parser.add_argument("--dialect", "-d", default="tsql", help="SQL dialect (tsql, mysql, postgres)")
 
+    # DB import mode
+    db_import_parser = subparsers.add_parser("db-import", help="Import parsed JSONL files from S3 into PostgreSQL")
+    db_import_parser.add_argument("--pattern", required=True, choices=["N", "R"], help="N=Notice, R=RCP")
+    db_import_parser.add_argument("--limite", type=int, help="Limit number of records to import (for testing)")
+
     # Pediatric classification mode
     ped_parser = subparsers.add_parser("classify-pediatric", help="Classify drugs for pediatric use")
     ped_parser.add_argument("--rcp", required=True, help="Parsed RCP JSONL file")
@@ -553,6 +612,13 @@ Environment variables for database:
         try:
             output_path = Path(args.output) if args.output else None
             sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "db-import":
+        try:
+            db_import(args.pattern, limite=args.limite)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
