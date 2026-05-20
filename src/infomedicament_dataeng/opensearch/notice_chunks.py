@@ -98,8 +98,22 @@ def _node_text(value) -> str:
     return (value or "").strip()
 
 
-def _make_embed_text(section_title: str, sub_header: str, body: str) -> str:
+EMBED_FORMATS = (
+    "default",  # "{section_title} > {sub_header}: {body}"
+    "domain-prefix",  # "Notice médicament — {section_title} > {sub_header}: {body}"
+    "subheader-only",  # "{sub_header}: {body}" — drops generic section title
+)
+
+
+def _make_embed_text(section_title: str, sub_header: str, body: str, fmt: str = "default") -> str:
     # bge-m3 does not require query/passage prefixes
+    if fmt == "domain-prefix":
+        if sub_header:
+            return f"Notice médicament — {section_title} > {sub_header}: {body}"
+        return f"Notice médicament — {section_title}: {body}"
+    if fmt == "subheader-only":
+        return f"{sub_header}: {body}" if sub_header else body
+    # default
     if sub_header:
         return f"{section_title} > {sub_header}: {body}"
     return f"{section_title}: {body}"
@@ -115,11 +129,12 @@ def _make_chunk(
     section_title: str,
     sub_header: str,
     body_nodes: list[dict],
+    embed_format: str = "default",
 ) -> dict | None:
     body_text = " ".join(_extract_text(n) for n in body_nodes).strip()
     if not body_text:
         return None
-    embed_text = _make_embed_text(section_title, sub_header, body_text)
+    embed_text = _make_embed_text(section_title, sub_header, body_text, fmt=embed_format)
     doc_id = f"{cis}_{section_anchor}_{hashlib.md5(embed_text.encode()).hexdigest()[:8]}"
     return {
         "_id": doc_id,
@@ -133,7 +148,7 @@ def _make_chunk(
     }
 
 
-def _iter_notice_chunks(record: dict) -> Iterator[dict]:
+def _iter_notice_chunks(record: dict, embed_format: str = "default") -> Iterator[dict]:
     cis = str(record.get("source", {}).get("cis", ""))
 
     for section in record.get("content", []):
@@ -164,7 +179,9 @@ def _iter_notice_chunks(record: dict) -> Iterator[dict]:
                     title=sub_title,
                     doc_type="notice",
                 )
-                chunk = _make_chunk(cis, child_anchor, section_title, sub_title, child.get("children") or [])
+                chunk = _make_chunk(
+                    cis, child_anchor, section_title, sub_title, child.get("children") or [], embed_format
+                )
                 if chunk:
                     yield chunk
         else:
@@ -174,7 +191,9 @@ def _iter_notice_chunks(record: dict) -> Iterator[dict]:
 
             for child in children:
                 if child.get("type") in _FLAT_HEADER_TYPES:
-                    chunk = _make_chunk(cis, anchor, section_title, current_sub_header, current_body_nodes)
+                    chunk = _make_chunk(
+                        cis, anchor, section_title, current_sub_header, current_body_nodes, embed_format
+                    )
                     if chunk:
                         yield chunk
                     current_sub_header = _node_text(child.get("content"))
@@ -183,7 +202,7 @@ def _iter_notice_chunks(record: dict) -> Iterator[dict]:
                     current_body_nodes.append(child)
 
             # Flush the last accumulated chunk
-            chunk = _make_chunk(cis, anchor, section_title, current_sub_header, current_body_nodes)
+            chunk = _make_chunk(cis, anchor, section_title, current_sub_header, current_body_nodes, embed_format)
             if chunk:
                 yield chunk
 
@@ -269,6 +288,7 @@ def index_notice_chunks(
     s3_client: S3Client | None = None,
     save_embeddings: bool = False,
     load_embeddings: bool = False,
+    embed_format: str = "default",
 ) -> int:
     """Chunk, embed via Albert API, and index an iterable of parsed notice records.
 
@@ -301,7 +321,7 @@ def index_notice_chunks(
                     total += _bulk_index(cached)
                     continue
             content_hash = _content_hash(record)
-            chunks = list(_iter_notice_chunks(record))
+            chunks = list(_iter_notice_chunks(record, embed_format))
             pairs: list[tuple[dict, list[float]]] = []
             for i in range(0, len(chunks), chunk_batch_size):
                 batch = chunks[i : i + chunk_batch_size]
@@ -320,7 +340,7 @@ def index_notice_chunks(
                     logger.info(f"Loaded {len(cached)} chunks from cache for CIS {cis}")
                     total += _bulk_index(cached)
                     continue
-            for chunk in _iter_notice_chunks(record):
+            for chunk in _iter_notice_chunks(record, embed_format):
                 pending.append(chunk)
                 if len(pending) >= chunk_batch_size:
                     embeddings = _embed_texts([c["embed_text"] for c in pending], embed_client, embed_model)
@@ -340,6 +360,7 @@ def index_from_local(
     os_config: OpenSearchConfig | None = None,
     albert_config=None,
     chunk_batch_size: int = 64,
+    embed_format: str = "default",
 ) -> int:
     """Index a local parsed notice JSONL file into OpenSearch via Albert API embeddings."""
     os_client = get_opensearch_client(os_config)
@@ -368,6 +389,7 @@ def index_from_local(
         os_client,
         index_name,
         chunk_batch_size=chunk_batch_size,
+        embed_format=embed_format,
     )
     logger.info(f"Indexed {total} chunks from {path} into '{index_name}'")
     return total
@@ -383,6 +405,7 @@ def index_from_s3(
     chunk_batch_size: int = 64,
     save_embeddings: bool = False,
     load_embeddings: bool = False,
+    embed_format: str = "default",
 ) -> int:
     """Index parsed notice JSONL files from S3 into OpenSearch via Albert API embeddings."""
     os_client = get_opensearch_client(os_config)
@@ -417,6 +440,7 @@ def index_from_s3(
         s3_client=s3,
         save_embeddings=save_embeddings,
         load_embeddings=load_embeddings,
+        embed_format=embed_format,
     )
     logger.info(f"Indexed {total} chunks from S3 into '{index_name}'")
     return total

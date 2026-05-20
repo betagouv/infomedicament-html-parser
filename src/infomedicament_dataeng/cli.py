@@ -19,6 +19,7 @@ from .datagouv import import_dataset, load_datasets
 from .db import get_authorized_cis, get_filename_to_cis_mapping, import_to_postgres
 from .io import charger_liste_cis
 from .opensearch.notice_chunks import DEFAULT_INDEX as NOTICE_CHUNKS_DEFAULT_INDEX
+from .opensearch.notice_chunks import EMBED_FORMATS
 from .opensearch.notice_chunks import index_from_local as index_notice_chunks_from_local
 from .opensearch.notice_chunks import index_from_s3 as index_notice_chunks_from_s3
 from .opensearch.sections import DEFAULT_INDEX as SECTIONS_DEFAULT_INDEX
@@ -690,6 +691,12 @@ Environment variables for database:
         "--index", default=NOTICE_CHUNKS_DEFAULT_INDEX, help=f"Index name (default: {NOTICE_CHUNKS_DEFAULT_INDEX})"
     )
     notice_chunks_parser.add_argument("--limite", type=int, help="Cap on records indexed (for testing)")
+    notice_chunks_parser.add_argument(
+        "--embed-format",
+        default="default",
+        choices=EMBED_FORMATS,
+        help="embed_text format (default: default)",
+    )
 
     # Global options
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -817,6 +824,7 @@ Environment variables for database:
                         index_name=args.index,
                         limite=args.limite,
                         chunk_batch_size=args.chunk_batch_size,
+                        embed_format=args.embed_format,
                     )
                 else:
                     index_notice_chunks_from_s3(
@@ -826,6 +834,7 @@ Environment variables for database:
                         chunk_batch_size=args.chunk_batch_size,
                         save_embeddings=args.save_embeddings,
                         load_embeddings=args.load_embeddings,
+                        embed_format=args.embed_format,
                     )
             except Exception as e:
                 logger.exception(f"Error: {e}")
