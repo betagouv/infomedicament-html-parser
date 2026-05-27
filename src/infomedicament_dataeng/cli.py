@@ -16,6 +16,7 @@ from tqdm import tqdm
 from .config import get_config
 from .convert import sql_to_csv
 from .datagouv import import_dataset, load_datasets
+from .datapackage_importer import import_datapackage
 from .db import get_authorized_cis, get_filename_to_cis_mapping, import_to_postgres
 from .io import charger_liste_cis
 from .opensearch.notice_chunks import DEFAULT_INDEX as NOTICE_CHUNKS_DEFAULT_INDEX
@@ -625,6 +626,20 @@ Environment variables for database:
     )
     datagouv_parser.add_argument("--dataset", help="Name of a specific dataset to import (default: all)")
 
+    # Import ANSM datapackage
+    datapackage_parser = subparsers.add_parser(
+        "import-datapackage", help="Import the ANSM frictionless datapackage into PostgreSQL"
+    )
+    datapackage_parser.add_argument(
+        "--package",
+        required=True,
+        help="Path or URL to a datapackage.json or a zip containing one",
+    )
+    datapackage_parser.add_argument(
+        "--resource",
+        help="Name of a single resource to load (default: all, in dependency order)",
+    )
+
     # Pediatric classification mode
     ped_parser = subparsers.add_parser("classify-pediatric", help="Classify drugs for pediatric use")
     ped_source = ped_parser.add_mutually_exclusive_group(required=True)
@@ -750,6 +765,13 @@ Environment variables for database:
     elif args.command == "import-datagouv":
         try:
             run_import_datagouv(args.config, dataset_name=args.dataset)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "import-datapackage":
+        try:
+            import_datapackage(args.package, resource_name=args.resource)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
