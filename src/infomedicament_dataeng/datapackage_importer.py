@@ -34,7 +34,7 @@ LOAD_ORDER = [
     "caracteristique",
 ]
 
-TABLE_PREFIX = "bdpm_"
+TABLE_PREFIX = "ansm_"
 
 
 def import_datapackage(
