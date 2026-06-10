@@ -32,6 +32,7 @@ LOAD_ORDER = [
     "dispositif",
     "document",
     "caracteristique",
+    "specialite_titulaire",
 ]
 
 TABLE_PREFIX = "ansm_"
