@@ -145,17 +145,17 @@ class TestImportDataset:
         assert "TRUNCATE" in sql.upper()
         assert "test_table" in sql
 
-    def test_inserts_all_rows(self, sample_dataset: DataGouvDataset):
+    def test_copies_all_rows(self, sample_dataset: DataGouvDataset):
         rows = [["val1", "val2", "val3"], ["val4", "val5", "val6"]]
         mock_engine_patch, mock_engine, mock_conn = self._mock_engine()
         with mock_engine_patch, patch("infomedicament_dataeng.datagouv.importer.fetch_csv", return_value=rows):
             import_dataset(sample_dataset)
-        insert_call = mock_conn.execute.call_args_list[1]
-        rows_passed = insert_call.args[1]
-        assert rows_passed == [
-            {"col_a": "val1", "col_b": "val2", "col_c": "val3"},
-            {"col_a": "val4", "col_b": "val5", "col_c": "val6"},
-        ]
+        cur = mock_conn.connection.dbapi_connection.cursor.return_value.__enter__.return_value
+        copy_sql, buf = cur.copy_expert.call_args.args
+        assert copy_sql.upper().startswith("COPY")
+        assert "test_table" in copy_sql
+        assert "col_a, col_b, col_c" in copy_sql
+        assert buf.getvalue() == '"val1","val2","val3"\n"val4","val5","val6"\n'
 
     def test_returns_row_count(self, sample_dataset: DataGouvDataset):
         rows = [["a", "b", "c"]] * 42
