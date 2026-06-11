@@ -54,3 +54,18 @@ datasets:
         type: str
       - name: libelle_smr
         type: str
+
+  url_has:
+    datagouv_dataset_id: "f67407e1-2dae-4edf-9d0f-b280d41b731a"
+    postgresql_table: url_has
+    source:
+      type: csv
+      delimiter: ";"
+      quotechar: '"'
+      encoding: utf-8
+      has_header: false
+    columns:
+      - name: code_ct
+        type: str
+      - name: url
+        type: str
