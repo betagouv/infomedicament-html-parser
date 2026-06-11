@@ -1,9 +1,11 @@
 """Import the ANSM frictionless datapackage into PostgreSQL."""
 
+import io
 import logging
 import os
 import tempfile
 import urllib.request
+from datetime import date, datetime
 
 from frictionless import Package
 from sqlalchemy import text
@@ -107,8 +109,47 @@ def import_datapackage(
             logger.debug(f"Removed temporary file {tmp_path}")
 
 
+def _pg_array_literal(items) -> str:
+    """Render a Python list as a PostgreSQL array literal, e.g. {"a","b"}.
+
+    Every element is double-quoted (with backslash-escaping of \\ and ") so the
+    literal is safe for any text content; None elements become an unquoted NULL.
+    """
+    parts = []
+    for el in items:
+        if el is None:
+            parts.append("NULL")
+        else:
+            s = str(el).replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"{s}"')
+    return "{" + ",".join(parts) + "}"
+
+
+def _to_text(value) -> str | None:
+    """Convert a frictionless cell to its COPY text form, or None for SQL NULL."""
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return _pg_array_literal(value)
+    return str(value)
+
+
+def _csv_field(text_value: str | None) -> str:
+    """CSV-encode one already-stringified cell for COPY ... FORMAT csv.
+
+    None -> bare empty field (the default CSV NULL marker).
+    Everything else is always quoted, so an empty string round-trips as "" (an
+    empty string, distinct from NULL) and embedded commas/quotes/newlines are safe.
+    """
+    if text_value is None:
+        return ""
+    return '"' + text_value.replace('"', '""') + '"'
+
+
 def _load_resource(package: Package, resource_name: str, table_name: str, engine) -> int:
-    """Truncate `table_name` and insert all rows from `resource_name`.
+    """Truncate `table_name` and COPY all rows from `resource_name`.
 
     Returns the number of rows inserted.
     """
@@ -125,18 +166,22 @@ def _load_resource(package: Package, resource_name: str, table_name: str, engine
 
     field_names = list(rows[0].keys())
     col_names = ", ".join(field_names)
-    placeholders = ", ".join(f":{k}" for k in field_names)
 
-    rows_as_dicts = [dict(row) for row in rows]
+    buf = io.StringIO()
+    for row in rows:
+        buf.write(",".join(_csv_field(_to_text(row[k])) for k in field_names))
+        buf.write("\n")
+    buf.seek(0)
 
-    logger.info(f"[{resource_name}] Truncating '{table_name}' ...")
+    logger.info(f"[{resource_name}] Truncating '{table_name}' and COPYing {len(rows):,} rows ...")
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE {table_name}"))
-        logger.info(f"[{resource_name}] Inserting {len(rows_as_dicts):,} rows into '{table_name}' ...")
-        conn.execute(
-            text(f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"),
-            rows_as_dicts,
-        )
+        raw = conn.connection.dbapi_connection
+        with raw.cursor() as cur:
+            cur.copy_expert(
+                f"COPY {table_name} ({col_names}) FROM STDIN WITH (FORMAT csv)",
+                buf,
+            )
 
-    logger.info(f"[{resource_name}] ✓ {len(rows_as_dicts):,} rows inserted into '{table_name}'")
-    return len(rows_as_dicts)
+    logger.info(f"[{resource_name}] ✓ {len(rows):,} rows inserted into '{table_name}'")
+    return len(rows)

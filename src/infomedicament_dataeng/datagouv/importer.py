@@ -99,18 +99,25 @@ def import_dataset(dataset: DataGouvDataset, config: PostgresConfig | None = Non
     rows = valid_rows
     logger.info(f"Fetched {len(rows)} rows for table '{dataset.postgresql_table}'")
 
-    col_keys = [c.name for c in dataset.columns]
-    col_names = ", ".join(col_keys)
-    placeholders = ", ".join(f":{k}" for k in col_keys)
-    rows_as_dicts = [dict(zip(col_keys, row)) for row in rows]
+    col_names = ", ".join(c.name for c in dataset.columns)
+
+    # Serialize rows to CSV with every field quoted, so empty fields round-trip as
+    # empty strings (not NULL) and delimiters/quotes/newlines are escaped. All cells
+    # are already strings (from csv.reader), so no type/null handling is needed.
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerows(rows)
+    buf.seek(0)
 
     engine = get_postgres_engine(config)
     with engine.begin() as conn:
         conn.execute(text(f"TRUNCATE TABLE {dataset.postgresql_table}"))
-        if rows_as_dicts:
-            conn.execute(
-                text(f"INSERT INTO {dataset.postgresql_table} ({col_names}) VALUES ({placeholders})"),
-                rows_as_dicts,
-            )
+        if rows:
+            raw = conn.connection.dbapi_connection
+            with raw.cursor() as cur:
+                cur.copy_expert(
+                    f"COPY {dataset.postgresql_table} ({col_names}) FROM STDIN WITH (FORMAT csv)",
+                    buf,
+                )
     logger.info(f"Imported {len(rows)} rows into '{dataset.postgresql_table}'")
     return len(rows)
