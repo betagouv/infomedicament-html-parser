@@ -103,6 +103,13 @@ class TestFetchCsv:
             rows = fetch_csv(sample_dataset)
         assert rows == [["val;1", "val2"]]
 
+    def test_keeps_first_row_when_no_header(self, sample_dataset: DataGouvDataset):
+        headerless_csv = "val1|val2|val3\nval4|val5|val6\n"
+        sample_dataset.source.has_header = False
+        with self._mock_urlopen(headerless_csv):
+            rows = fetch_csv(sample_dataset)
+        assert rows == [["val1", "val2", "val3"], ["val4", "val5", "val6"]]
+
     def test_builds_correct_url(self, sample_dataset: DataGouvDataset):
         with self._mock_urlopen(SAMPLE_CSV) as mock_urlopen:
             fetch_csv(sample_dataset)
