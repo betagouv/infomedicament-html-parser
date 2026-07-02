@@ -530,6 +530,43 @@ def run_import_datagouv(config_path: Path, dataset_name: str | None = None) -> N
         logger.info(f"Done: {count} rows imported into '{dataset.postgresql_table}'")
 
 
+def run_centralise_fetch(cis: str | None = None, refresh: bool = False, limite: int | None = None) -> None:
+    """Download and cache EMA product-information PDFs on S3 (acquisition step).
+
+    With ``cis`` set, fetches only that CIS's PDF, so the full pipeline can be
+    prototyped on one PDF without an expensive initial parse run.
+    """
+    from .centralise.acquire import get_ema_pdf, pdf_cache_key
+    from .db import get_centralised_worklist
+
+    s3_client = make_s3_client()
+    worklist = get_centralised_worklist(cis=cis)
+    if not worklist:
+        logger.warning(f"No EMA PDFs found in worklist{f' for CIS {cis}' if cis else ''}")
+        return
+
+    urls = list(worklist.keys())
+    if limite is not None:
+        urls = urls[:limite]
+    logger.info(f"{len(urls)} distinct PDF(s) to acquire (refresh={refresh})")
+
+    acquired = 0
+    for url in tqdm(urls, desc="PDFs", unit="pdf"):
+        try:
+            # Warming the cache only needs a cheap existence check, not the bytes.
+            if not refresh and s3_client.object_exists(pdf_cache_key(url)):
+                logger.info(f"Already cached: {url} (shared by {len(worklist[url])} CIS)")
+                acquired += 1
+                continue
+            pdf = get_ema_pdf(url, s3_client, refresh=refresh)
+            logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
+            acquired += 1
+        except Exception as e:
+            logger.error(f"Failed to acquire {url}: {e}")
+
+    logger.info(f"Acquisition complete: {acquired}/{len(urls)} PDFs cached")
+
+
 def run_index_sections(
     doc_type: str,
     index_name: str,
@@ -655,6 +692,20 @@ Environment variables for database:
     ped_parser.add_argument("--output", "-o", default="data/predictions.csv", help="Output predictions CSV")
     ped_parser.add_argument("--batch-size", type=int, default=500, help="RCPs per batch (default: 500)")
     ped_parser.add_argument("--debug", action="store_true", help="Write debug_sections.jsonl with raw section texts")
+
+    # Centralised EMA PDF pipeline (subcommand group)
+    centralise_parser = subparsers.add_parser("centralise", help="Centrally-authorised EMA PDF pipeline")
+    centralise_subparsers = centralise_parser.add_subparsers(dest="target", help="Centralise step")
+
+    # centralise fetch — download + cache PDFs on S3
+    centralise_fetch_parser = centralise_subparsers.add_parser(
+        "fetch", help="Download and cache EMA product-information PDFs on S3"
+    )
+    centralise_fetch_parser.add_argument("--cis", help="Fetch only the PDF for this CIS code (for prototyping)")
+    centralise_fetch_parser.add_argument(
+        "--refresh", action="store_true", help="Force re-download from EMA even if already cached on S3"
+    )
+    centralise_fetch_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to fetch")
 
     # Index into OpenSearch (subcommand group)
     os_parser = subparsers.add_parser("index-opensearch", help="Index data into OpenSearch")
@@ -807,6 +858,17 @@ Environment variables for database:
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
+
+    elif args.command == "centralise":
+        if not getattr(args, "target", None):
+            centralise_parser.print_help()
+            raise SystemExit(1)
+        if args.target == "fetch":
+            try:
+                run_centralise_fetch(cis=args.cis, refresh=args.refresh, limite=args.limite)
+            except Exception as e:
+                logger.exception(f"Error: {e}")
+                raise SystemExit(1)
 
     elif args.command == "index-opensearch":
         if not getattr(args, "target", None):
