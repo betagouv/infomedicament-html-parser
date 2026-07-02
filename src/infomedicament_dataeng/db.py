@@ -74,6 +74,30 @@ def get_authorized_cis(config: DatabaseConfig | None = None) -> set[str]:
         return {str(row[0]) for row in result.fetchall()}
 
 
+def get_centralised_worklist(config: DatabaseConfig | None = None, cis: str | None = None) -> dict[str, list[str]]:
+    """Map each distinct EMA PI PDF URL to the CIS codes that share it.
+
+    Reads the PDBM ``VUEmaEpar`` view (``SpecId`` = codeCIS, ``UrlEpar`` = the
+    direct French PI PDF). Many CIS can share one PDF, so callers parse each URL
+    once and fan out one record per CIS.
+
+    When ``cis`` is given, only the PDF for that CIS is returned (still grouped
+    with any sibling CIS sharing it), so the full pipeline can be prototyped on a
+    single PDF. Returns an empty dict if the CIS has no EMA PDF.
+    """
+    engine = get_mysql_engine(config)
+    worklist: dict[str, list[str]] = {}
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT SpecId, UrlEpar FROM VUEmaEpar WHERE UrlEpar IS NOT NULL AND UrlEpar <> ''"))
+        for spec_id, url in result.fetchall():
+            worklist.setdefault(url, []).append(str(spec_id))
+
+    if cis is not None:
+        target = next((url for url, cis_list in worklist.items() if cis in cis_list), None)
+        return {target: worklist[target]} if target is not None else {}
+    return worklist
+
+
 def get_clean_html(html: str) -> str:
     """Remove <a name="...">...</a> tags while preserving their content."""
     return re.sub(r"<a name=[^>]*>(.*?)</a>", r"\1", html, flags=re.DOTALL)

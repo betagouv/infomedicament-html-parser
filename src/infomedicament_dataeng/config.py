@@ -16,6 +16,7 @@ class S3Config:
     notice_prefix: str  # Prefix for Notices HTML files in bucket
     rcp_prefix: str  # Prefix for RCP HTML files in bucket
     output_prefix: str  # Prefix for output files (e.g., "exports/parsed/")
+    ema_pdf_prefix: str  # Prefix for cached EMA product-information PDFs
 
     @classmethod
     def from_env(cls) -> "S3Config":
@@ -28,6 +29,7 @@ class S3Config:
             notice_prefix=os.environ.get("S3_HTML_NOTICE_PREFIX", "imports/notice/"),
             rcp_prefix=os.environ.get("S3_HTML_RCP_PREFIX", "imports/rcp/"),
             output_prefix=os.environ.get("S3_OUTPUT_PREFIX", "exports/parsed/"),
+            ema_pdf_prefix=os.environ.get("S3_EMA_PDF_PREFIX", "imports/ema_pdf/"),
         )
 
     def is_configured(self) -> bool:
