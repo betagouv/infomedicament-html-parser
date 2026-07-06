@@ -5,6 +5,7 @@ Data engineering tools for ANSM's [infomedicament](https://infomedicament.beta.g
 ## Features
 
 - [HTML Parsing](#html-parsing) — parse ANSM Notice/RCP HTML files from local disk or S3
+- [Centralised EMA PDFs](#centralised-ema-pdfs) — parse centrally-authorised medicines' EMA PDFs into the same Notice/RCP shape
 - [DB Import](#db-import) — import parsed JSONL files into PostgreSQL
 - [OpenSearch Indexing](#opensearch-indexing) — index parsed sections into OpenSearch for full-text search
 - [SQL to CSV](#sql-to-csv-conversion) — convert T-SQL/MySQL dump files to CSV
@@ -77,6 +78,83 @@ poetry run infomedicament-dataeng s3 --pattern N --staging
 #### Global Options
 
 - `--verbose, -v`: Enable debug logging
+
+### Centralised EMA PDFs
+
+Centrally-authorised medicines (approved via the EMA, not the ANSM) have no ANSM Notice/RCP HTML.
+Instead their product information is published as a single EMA PDF (the EU QRD template).
+This pipeline parses those PDFs into the **same block-tree JSONL shape** the HTML parser produces,
+so the downstream `db-import` and `index-opensearch` steps are unchanged — a centralised CIS lands
+in the `rcp`/`notices` tables exactly like an ANSM one.
+
+Two things make these PDFs different:
+
+- **One PDF bundles several presentations.** A PDF often contains one SmPC + Notice per device
+  (cartouche, pen…) or per dosage (5/10/15/20 mg), and the several CIS that share one `UrlEpar` are
+  one-per-presentation — so content genuinely differs per CIS. The parser extracts *all*
+  presentations and matches each CIS to its own by Jaccard token-overlap of the PDF denomination
+  against the CIS's `SpecDenom01`. A CIS with an empty `SpecDenom01` that can't be disambiguated is
+  skipped (no record).
+- **They must be acquired, not just read.** PDFs are scraped from EMA once and cached forever on S3
+  (under `S3_EMA_PDF_PREFIX`, with a `.sha256` sidecar); re-runs serve from cache unless `--refresh`.
+
+The worklist comes from the PDBM database (`VUEmaEpar` LEFT JOIN `Specialite`).
+
+#### 1. Fetch — cache PDFs on S3
+
+```bash
+poetry run infomedicament-dataeng centralise fetch [options]
+```
+
+Options:
+- `--cis`: Fetch only the PDF for this CIS code (for prototyping the pipeline on one drug)
+- `--refresh`: Force re-download from EMA even if already cached on S3
+- `--limite`: Limit number of distinct PDFs to fetch
+
+The first full run is the expensive one (one HTTP round-trip per distinct PDF, ~2 MB each);
+subsequent runs only do a cheap existence check and skip anything already cached.
+
+#### 2. Parse — PDFs to Notice/RCP JSONL
+
+```bash
+poetry run infomedicament-dataeng centralise parse [options]
+```
+
+Options:
+- `--cis`: Parse only the PDF for this CIS code
+- `--pdf PATH`: Parse a single **local** PDF file (requires `--cis`); emits every presentation for
+  inspection and writes locally — for prototyping
+- `--output-dir, -o`: Write `parsed_R_*.jsonl` / `parsed_N_*.jsonl` locally to this dir (default: S3)
+- `--limite`: Limit number of distinct PDFs to parse
+
+Worklist mode (no `--pdf`) fetches each distinct PDF via the S3 cache, parses all its presentations
+once, matches each CIS to its own presentation, and writes one JSONL line per CIS to
+`S3_OUTPUT_PREFIX` — the same prefix and `parsed_R/N_*.jsonl` naming the HTML parser uses.
+
+#### Full pipeline (all centralised medicines)
+
+Drop `--cis` to process every centrally-authorised CIS. Steps 3–4 are the *same* commands used for
+ANSM content; `--since` scopes them to the JSONL that today's parse just produced.
+
+```bash
+# 1. Acquire every EMA PDF into the S3 cache
+poetry run infomedicament-dataeng centralise fetch
+
+# 2. Parse all cached PDFs -> parsed_R/N_*.jsonl on S3 (one line per CIS)
+poetry run infomedicament-dataeng centralise parse
+
+# 3. Import into PostgreSQL
+poetry run infomedicament-dataeng db-import --pattern R --since $(date +%Y-%m-%d)
+poetry run infomedicament-dataeng db-import --pattern N --since $(date +%Y-%m-%d)
+
+# 4. Index into OpenSearch
+poetry run infomedicament-dataeng index-opensearch sections --doc-type rcp    --s3 --since $(date +%Y-%m-%d)
+poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --s3 --since $(date +%Y-%m-%d)
+poetry run infomedicament-dataeng index-opensearch notice-chunks --s3 --save-embeddings --load-embeddings --since $(date +%Y-%m-%d)
+```
+
+To prototype the whole flow end-to-end on a single drug, thread `--cis <code>` through steps 1–2
+and use `--limite` on the import/index steps.
 
 ### DB Import
 
@@ -354,6 +432,7 @@ When only a small number of new or updated HTML files arrive, avoid reprocessing
 - `S3_BUCKET_NAME`: Bucket name (default: info-medicaments)
 - `S3_HTML_NOTICE_PREFIX`: Prefix for Notice HTML files (default: imports/notice/)
 - `S3_HTML_RCP_PREFIX`: Prefix for RCP HTML files (default: imports/rcp/)
+- `S3_EMA_PDF_PREFIX`: Prefix for cached centralised EMA PDFs (default: imports/ema_pdf/)
 - `S3_OUTPUT_PREFIX`: Prefix for output files (default: exports/parsed/)
 
 ### Database
@@ -442,6 +521,10 @@ scalingo --app your-app run "python -m infomedicament_dataeng.cli index-opensear
 # Full reindex
 scalingo --app your-app run "python -m infomedicament_dataeng.cli index-opensearch sections --doc-type notice --s3"
 scalingo --app your-app run "python -m infomedicament_dataeng.cli index-opensearch sections --doc-type rcp --s3"
+
+# Centralised EMA PDFs: acquire + parse (feeds the same db-import / index steps above)
+scalingo --app your-app run --size 2XL "python -m infomedicament_dataeng.cli centralise fetch"
+scalingo --app your-app run --size 2XL "python -m infomedicament_dataeng.cli centralise parse"
 ```
 
 For automated execution, we will use [Scalingo Scheduler](https://doc.scalingo.com/platform/app/task-scheduling/scalingo-scheduler) with a `cron.json` file.

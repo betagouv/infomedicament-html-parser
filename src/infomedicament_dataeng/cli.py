@@ -7,6 +7,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -561,10 +562,95 @@ def run_centralise_fetch(cis: str | None = None, refresh: bool = False, limite: 
             pdf = get_ema_pdf(url, s3_client, refresh=refresh)
             logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
             acquired += 1
+            time.sleep(1.0)  # polite gap between real EMA hits to avoid 429s
         except Exception as e:
             logger.error(f"Failed to acquire {url}: {e}")
 
     logger.info(f"Acquisition complete: {acquired}/{len(urls)} PDFs cached")
+
+
+def _write_parsed(records: list[dict], pattern: str, timestamp: str, output_dir: str | None) -> None:
+    """Write fanned-out JSONL records for one pattern, to a local dir or S3."""
+    if not records:
+        logger.info(f"No {pattern} records to write")
+        return
+    filename = f"parsed_{pattern}_{timestamp}.jsonl"
+    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
+    if output_dir:
+        path = os.path.join(output_dir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body + "\n")
+        logger.info(f"Wrote {len(records)} {pattern} records to {path}")
+    else:
+        key = f"{get_config().s3.output_prefix}{filename}"
+        make_s3_client().upload_file_content(key, body, content_type="application/x-ndjson")
+        logger.info(f"Wrote {len(records)} {pattern} records to S3: {key}")
+
+
+def run_centralise_parse(
+    cis: str | None = None,
+    pdf_path: str | None = None,
+    output_dir: str | None = None,
+    limite: int | None = None,
+) -> None:
+    """Parse centralised EMA PDFs into RCP + Notice JSONL, one line per CIS.
+
+    A PDF bundles one presentation per device (cartouche, pen, …); worklist mode
+    (default) fetches each distinct PDF via the S3 cache, parses all its
+    presentations once, and matches each CIS to its own via ``SpecDenom01``.
+    ``--pdf`` parses a single local file and emits every presentation for
+    inspection (writes locally) — for prototyping.
+    """
+    from .centralise.match import match_presentation
+    from .centralise.parser import assemble_document, parse_pdf
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rcp_lines: list[dict] = []
+    notice_lines: list[dict] = []
+
+    def record(doc: dict, filename: str, cis_code: str, title: str) -> dict:
+        return {
+            "source": {"filename": filename, "cis": cis_code, "denomination": doc["denomination"]},
+            "content": assemble_document(doc["content"], title, doc["date_notif"]),
+        }
+
+    if pdf_path:
+        if not cis:
+            raise ValueError("--pdf requires --cis to tag the output record")
+        res = parse_pdf(Path(pdf_path).read_bytes())
+        filename = os.path.basename(pdf_path)
+        rcp_lines += [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
+        notice_lines += [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
+        output_dir = output_dir or "."  # prototyping: default to local cwd
+    else:
+        from .centralise.acquire import get_ema_pdf, pdf_cache_key
+        from .db import get_centralised_worklist
+
+        s3_client = make_s3_client()
+        worklist = get_centralised_worklist(cis=cis)
+        urls = list(worklist)
+        if limite is not None:
+            urls = urls[:limite]
+        logger.info(f"{len(urls)} distinct PDF(s) to parse")
+
+        for url in tqdm(urls, desc="PDFs", unit="pdf"):
+            try:
+                res = parse_pdf(get_ema_pdf(url, s3_client))
+                filename = pdf_cache_key(url).split("/")[-1]
+                for cis_code, denom in worklist[url]:
+                    rcp_doc = match_presentation(denom, res["rcp"])
+                    notice_doc = match_presentation(denom, res["notice"])
+                    title = denom or (rcp_doc or notice_doc or {}).get("denomination", "")
+                    if rcp_doc:
+                        rcp_lines.append(record(rcp_doc, filename, cis_code, title))
+                    if notice_doc:
+                        notice_lines.append(record(notice_doc, filename, cis_code, title))
+            except Exception as e:
+                logger.error(f"Failed to parse {url}: {e}")
+
+    logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
+    _write_parsed(rcp_lines, "R", timestamp, output_dir)
+    _write_parsed(notice_lines, "N", timestamp, output_dir)
 
 
 def run_index_sections(
@@ -706,6 +792,17 @@ Environment variables for database:
         "--refresh", action="store_true", help="Force re-download from EMA even if already cached on S3"
     )
     centralise_fetch_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to fetch")
+
+    # centralise parse — parse PDFs into RCP + Notice JSONL (one line per CIS)
+    centralise_parse_parser = centralise_subparsers.add_parser(
+        "parse", help="Parse EMA PDFs into RCP + Notice JSONL, one line per CIS"
+    )
+    centralise_parse_parser.add_argument("--cis", help="Parse only the PDF for this CIS code")
+    centralise_parse_parser.add_argument("--pdf", help="Parse a single local PDF file (requires --cis); writes locally")
+    centralise_parse_parser.add_argument(
+        "--output-dir", "-o", help="Write parsed_R/N_*.jsonl locally to this dir (default: S3)"
+    )
+    centralise_parse_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to parse")
 
     # Index into OpenSearch (subcommand group)
     os_parser = subparsers.add_parser("index-opensearch", help="Index data into OpenSearch")
@@ -866,6 +963,12 @@ Environment variables for database:
         if args.target == "fetch":
             try:
                 run_centralise_fetch(cis=args.cis, refresh=args.refresh, limite=args.limite)
+            except Exception as e:
+                logger.exception(f"Error: {e}")
+                raise SystemExit(1)
+        elif args.target == "parse":
+            try:
+                run_centralise_parse(cis=args.cis, pdf_path=args.pdf, output_dir=args.output_dir, limite=args.limite)
             except Exception as e:
                 logger.exception(f"Error: {e}")
                 raise SystemExit(1)
