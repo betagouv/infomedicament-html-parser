@@ -74,26 +74,35 @@ def get_authorized_cis(config: DatabaseConfig | None = None) -> set[str]:
         return {str(row[0]) for row in result.fetchall()}
 
 
-def get_centralised_worklist(config: DatabaseConfig | None = None, cis: str | None = None) -> dict[str, list[str]]:
-    """Map each distinct EMA PI PDF URL to the CIS codes that share it.
+def get_centralised_worklist(
+    config: DatabaseConfig | None = None, cis: str | None = None
+) -> dict[str, list[tuple[str, str]]]:
+    """Map each distinct EMA PI PDF URL to the ``(CIS, denomination)`` sharing it.
 
     Reads the PDBM ``VUEmaEpar`` view (``SpecId`` = codeCIS, ``UrlEpar`` = the
-    direct French PI PDF). Many CIS can share one PDF, so callers parse each URL
-    once and fan out one record per CIS.
+    direct French PI PDF), joined to ``Specialite`` for each CIS's ``SpecDenom01``.
+    Many CIS share one PDF — one per device presentation — so callers parse each
+    URL once and match each CIS to its presentation via its denomination.
 
     When ``cis`` is given, only the PDF for that CIS is returned (still grouped
-    with any sibling CIS sharing it), so the full pipeline can be prototyped on a
-    single PDF. Returns an empty dict if the CIS has no EMA PDF.
+    with its sibling CIS), so the pipeline can be prototyped on a single PDF.
+    Returns an empty dict if the CIS has no EMA PDF.
     """
     engine = get_mysql_engine(config)
-    worklist: dict[str, list[str]] = {}
+    worklist: dict[str, list[tuple[str, str]]] = {}
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT SpecId, UrlEpar FROM VUEmaEpar WHERE UrlEpar IS NOT NULL AND UrlEpar <> ''"))
-        for spec_id, url in result.fetchall():
-            worklist.setdefault(url, []).append(str(spec_id))
+        result = conn.execute(
+            text(
+                "SELECT v.SpecId, v.UrlEpar, s.SpecDenom01"
+                " FROM VUEmaEpar v LEFT JOIN Specialite s ON s.SpecId = v.SpecId"
+                " WHERE v.UrlEpar IS NOT NULL AND v.UrlEpar <> ''"
+            )
+        )
+        for spec_id, url, denom in result.fetchall():
+            worklist.setdefault(url, []).append((str(spec_id), denom or ""))
 
     if cis is not None:
-        target = next((url for url, cis_list in worklist.items() if cis in cis_list), None)
+        target = next((url for url, rows in worklist.items() if any(c == cis for c, _ in rows)), None)
         return {target: worklist[target]} if target is not None else {}
     return worklist
 

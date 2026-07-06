@@ -65,3 +65,47 @@ class TestGetEmaPdf:
         assert get_ema_pdf(URL, s3, refresh=True) == b"%PDF-new"
         assert s3.downloaded == []
         assert EXPECTED_KEY in s3.uploads
+
+
+def _doc(denom, tag):
+    return {"denomination": denom, "date_notif": "", "content": [{"type": "AmmCorpsTexte", "content": tag}]}
+
+
+class TestParseFanOut:
+    """`centralise parse` emits one line per CIS, each matched to its presentation."""
+
+    def test_fans_out_and_matches_presentation(self, tmp_path, monkeypatch):
+        import glob
+        import json
+
+        from infomedicament_dataeng import cli, db
+        from infomedicament_dataeng.centralise import acquire as acq
+        from infomedicament_dataeng.centralise import parser
+
+        worklist = {
+            URL: [
+                ("111", "ABASAGLAR 100 unités/ml solution injectable en cartouche"),
+                ("222", "ABASAGLAR 100 unités/ml solution injectable en stylo prérempli"),
+            ]
+        }
+        parsed = {
+            "rcp": [_doc("… en cartouche", "rcp-cartouche"), _doc("… KwikPen … stylo prérempli", "rcp-pen")],
+            "notice": [_doc("… en cartouche", "notice-cartouche"), _doc("… KwikPen … stylo prérempli", "notice-pen")],
+        }
+
+        monkeypatch.setattr(cli, "make_s3_client", lambda: object())
+        monkeypatch.setattr(acq, "get_ema_pdf", lambda url, s3=None, **k: b"%PDF")
+        monkeypatch.setattr(db, "get_centralised_worklist", lambda cis=None: worklist)
+        monkeypatch.setattr(parser, "parse_pdf", lambda b: parsed)
+
+        cli.run_centralise_parse(output_dir=str(tmp_path))
+
+        files = glob.glob(str(tmp_path / "parsed_R_*.jsonl"))
+        assert len(files) == 1
+        by_cis = {json.loads(ln)["source"]["cis"]: json.loads(ln) for ln in open(files[0]).read().splitlines()}
+        assert set(by_cis) == {"111", "222"}
+        # each CIS got the content of its own presentation
+        assert by_cis["111"]["content"][-1]["content"] == "rcp-cartouche"
+        assert by_cis["222"]["content"][-1]["content"] == "rcp-pen"
+        # title is the CIS's own SpecDenom01
+        assert by_cis["111"]["content"][0] == {"type": "AmmAnnexeTitre", "content": worklist[URL][0][1]}

@@ -33,6 +33,12 @@ def _p(text: str) -> str:
     return f"<p>{html.escape(text)}</p>"
 
 
+def _is_notice_header(text: str) -> bool:
+    """Match the QRD notice header across wordings:
+    'Notice: Information de l'utilisateur' / 'Notice : Information du patient'."""
+    return text.startswith("Notice") and "information" in text.lower()
+
+
 class _NodeBuilder:
     """Accumulate ordered elements into a nested content node-list."""
 
@@ -48,9 +54,6 @@ class _NodeBuilder:
         self._prev_page: int | None = None
         self.date_notif = ""
         self._await_date = False  # notice: next line after the "révisée" marker
-        # ANNEXE I bundles one SmPC per presentation; keep only the first.
-        self._seen_section1 = False
-        self._done = False
 
     # -- sinks -------------------------------------------------------------
     def _sink(self) -> list[dict]:
@@ -103,11 +106,6 @@ class _NodeBuilder:
                 return True
             m1 = _RCP_L1.match(text)
             if m1 and m1.group(1) in _RCP_NUMBER_TO_ANCHOR:
-                if m1.group(1) == "1":
-                    if self._seen_section1:
-                        self._done = True  # second SmPC starts here — stop.
-                        return True
-                    self._seen_section1 = True
                 self._open_titre1("AmmAnnexeTitre1", text, m1.group(1))
                 return True
         else:
@@ -119,8 +117,6 @@ class _NodeBuilder:
 
     # -- element dispatch --------------------------------------------------
     def add(self, el) -> None:
-        if self._done:
-            return
         if isinstance(el, Table):
             self._flush()
             self._sink().append({"type": "table", "tag": "table", "html": el.html, "children": el.children})
@@ -181,68 +177,109 @@ class _NodeBuilder:
                         return
 
 
-def _rcp_title(content: list[dict]) -> str:
-    """RCP title = the denomination (first body text under section 1)."""
-    for node in content:
+def _rcp_denomination(body: list[dict]) -> str:
+    """RCP denomination = the body text under section 1 (used to match a CIS).
+
+    A single SmPC can cover several devices (e.g. KwikPen + Tempo Pen), so all
+    of section 1's body lines are joined, not just the first.
+    """
+    for node in body:
         if node.get("type") == "AmmAnnexeTitre1" and node["content"].startswith("1."):
-            for child in node.get("children", []):
-                if child.get("type") in ("AmmCorpsTexte", "AmmCorpsTexteGras"):
-                    return child["content"]
+            parts = [c["content"] for c in node.get("children", []) if isinstance(c.get("content"), str)]
+            return " ".join(parts)
     return ""
 
 
-def _notice_title(elements: list) -> str:
-    """Notice title = the product line right after the 'Notice: …' header."""
+def _notice_denomination(elements: list) -> str:
+    """Notice denomination = the product line right after the 'Notice: …' header."""
     for i, el in enumerate(elements):
-        if isinstance(el, TextLine) and el.text.startswith("Notice") and "utilisateur" in el.text:
+        if isinstance(el, TextLine) and _is_notice_header(el.text):
             for nxt in elements[i + 1 :]:
                 if isinstance(nxt, TextLine) and nxt.text.strip():
                     return nxt.text.strip()
     return ""
 
 
-def _find_ranges(doc: fitz.Document) -> tuple[range | None, range | None]:
-    """Locate the ANNEXE I (RCP) and first ANNEXE III.B notice page ranges."""
-    annexe: dict[str, int] = {}
-    b_notice: int | None = None
-    notice_header: int | None = None
-    revision: int | None = None
-
+def _find_annexe1_range(doc: fitz.Document) -> range | None:
+    """Page range of ANNEXE I (the RCP annexe), up to ANNEXE II."""
+    start = end = None
     for pno in range(doc.page_count):
-        for block in doc[pno].get_text("dict")["blocks"]:
-            if "lines" not in block:
+        for text, bold in _bold_lines(doc[pno]):
+            if bold and text == "ANNEXE I" and start is None:
+                start = pno
+            elif bold and text == "ANNEXE II" and end is None:
+                end = pno
+    if start is None:
+        return None
+    return range(start, end if end is not None else doc.page_count)
+
+
+def _find_notice_ranges(doc: fitz.Document) -> list[range]:
+    """Page range of each ANNEXE III.B notice (one per presentation).
+
+    A notice runs from its 'Notice: … utilisateur' header to the 'La dernière
+    date … cette notice a été révisée' marker (inclusive), bounded by the next
+    header. The 'ce manuel a été révisé' marker is ignored (device manual).
+    """
+    b_notice = None
+    headers: list[int] = []
+    revisions: list[int] = []
+    for pno in range(doc.page_count):
+        for text, bold in _bold_lines(doc[pno]):
+            if not bold:
                 continue
-            for line in block["lines"]:
-                spans = line["spans"]
-                text = "".join(s["text"] for s in spans).strip()
-                bold = bool(spans[0]["flags"] & 16)
-                if not bold:
-                    continue
-                for roman in ("I", "II", "III"):
-                    if text == f"ANNEXE {roman}" and roman not in annexe:
-                        annexe[roman] = pno
-                if text.startswith("B. NOTICE") and b_notice is None:
-                    b_notice = pno
-                is_notice_header = text.startswith("Notice") and "utilisateur" in text
-                if b_notice is not None and notice_header is None and is_notice_header:
-                    notice_header = pno
-                if notice_header is not None and revision is None and text.startswith("La dernière date"):
-                    revision = pno
+            if text.startswith("B. NOTICE") and b_notice is None:
+                b_notice = pno
+            if b_notice is not None and _is_notice_header(text):
+                headers.append(pno)
+            if text.startswith("La dernière date") and "notice" in text:
+                revisions.append(pno)
 
-    rcp_range = None
-    if "I" in annexe:
-        end = annexe.get("II", doc.page_count)
-        rcp_range = range(annexe["I"], end)
-
-    notice_range = None
-    if notice_header is not None:
-        end = (revision + 1) if revision is not None else doc.page_count
-        notice_range = range(notice_header, end)
-
-    return rcp_range, notice_range
+    ranges: list[range] = []
+    for i, header in enumerate(headers):
+        nxt = headers[i + 1] if i + 1 < len(headers) else doc.page_count
+        rev = next((r for r in revisions if header <= r < nxt), None)
+        ranges.append(range(header, (rev + 1) if rev is not None else nxt))
+    return ranges
 
 
-def _assemble(body: list[dict], title: str, date_notif: str) -> list[dict]:
+def _bold_lines(page: fitz.Page):
+    """Yield (text, is_bold) for each non-empty line on the page."""
+    for block in page.get_text("dict")["blocks"]:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            spans = line["spans"]
+            text = "".join(s["text"] for s in spans).strip()
+            if text:
+                yield text, bool(spans[0]["flags"] & 16)
+
+
+def _split_smpcs(elements: list) -> list[list]:
+    """Split an ANNEXE I element stream into one group per SmPC (at each §1)."""
+    groups: list[list] = []
+    current: list | None = None
+    for el in elements:
+        if isinstance(el, TextLine) and el.bold:
+            m = _RCP_L1.match(el.text)
+            if m and m.group(1) == "1":  # a new "1. DÉNOMINATION" starts a SmPC
+                current = []
+                groups.append(current)
+        if current is not None:
+            current.append(el)
+    return groups
+
+
+def _build_body(elements: list, kind: str) -> tuple[list[dict], str]:
+    """Run the node builder over one presentation's elements; return (body, date)."""
+    builder = _NodeBuilder(kind)
+    for el in elements:
+        builder.add(el)
+    return builder.finish(), builder.date_notif
+
+
+def assemble_document(body: list[dict], title: str, date_notif: str) -> list[dict]:
+    """Prepend the AmmAnnexeTitre / DateNotif metadata nodes to a body."""
     content: list[dict] = []
     if title:
         content.append({"type": "AmmAnnexeTitre", "content": title})
@@ -253,32 +290,32 @@ def _assemble(body: list[dict], title: str, date_notif: str) -> list[dict]:
 
 
 def parse_pdf(pdf_bytes: bytes) -> dict[str, list[dict]]:
-    """Parse an EMA PI PDF into ``{"rcp": [...], "notice": [...]}`` node-lists.
+    """Parse an EMA PI PDF into all its RCP and Notice presentations.
 
-    Either list is empty if the corresponding annexe can't be located.
+    Returns ``{"rcp": [doc, …], "notice": [doc, …]}`` where each ``doc`` is
+    ``{"denomination": str, "date_notif": str, "content": [body nodes]}``. One
+    PDF bundles one presentation per device (cartouche, pen, …); the caller
+    matches each CIS to its presentation (see ``match.py``) and prepends the
+    metadata via ``assemble_document``.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    rcp_range, notice_range = _find_ranges(doc)
-
     result: dict[str, list[dict]] = {"rcp": [], "notice": []}
 
-    if rcp_range is not None:
-        elements = extract_elements(doc, rcp_range)
-        builder = _NodeBuilder("rcp")
-        for el in elements:
-            builder.add(el)
-        body = builder.finish()
-        # Drop the ANNEXE I cover lines ("ANNEXE I", "RÉSUMÉ …") before section 1.
-        while body and body[0].get("type") != "AmmAnnexeTitre1":
-            body.pop(0)
-        result["rcp"] = _assemble(body, _rcp_title(body), builder.date_notif)
+    annexe1 = _find_annexe1_range(doc)
+    if annexe1 is not None:
+        for group in _split_smpcs(extract_elements(doc, annexe1)):
+            body, date_notif = _build_body(group, "rcp")
+            if body:
+                result["rcp"].append(
+                    {"denomination": _rcp_denomination(body), "date_notif": date_notif, "content": body}
+                )
 
-    if notice_range is not None:
-        elements = extract_elements(doc, notice_range)
-        builder = _NodeBuilder("notice")
-        for el in elements:
-            builder.add(el)
-        body = builder.finish()
-        result["notice"] = _assemble(body, _notice_title(elements), builder.date_notif)
+    for rng in _find_notice_ranges(doc):
+        elements = extract_elements(doc, rng)
+        body, date_notif = _build_body(elements, "notice")
+        if body:
+            result["notice"].append(
+                {"denomination": _notice_denomination(elements), "date_notif": date_notif, "content": body}
+            )
 
     return result
