@@ -569,14 +569,22 @@ def run_centralise_fetch(cis: str | None = None, refresh: bool = False, limite: 
     logger.info(f"Acquisition complete: {acquired}/{len(urls)} PDFs cached")
 
 
-def _write_parsed(records: list[dict], pattern: str, timestamp: str, output_dir: str | None) -> None:
-    """Write fanned-out JSONL records for one pattern, to a local dir or S3."""
+def _write_parsed(
+    records: list[dict], pattern: str, timestamp: str, output_dir: str | None, batch_num: int | None = None
+) -> None:
+    """Write fanned-out JSONL records for one pattern, to a local dir or S3.
+
+    When ``batch_num`` is given, the filename carries a ``_batchNNN`` suffix so a
+    long run flushes many files instead of one, keeping progress durable.
+    """
     if not records:
         logger.info(f"No {pattern} records to write")
         return
-    filename = f"parsed_{pattern}_{timestamp}.jsonl"
+    suffix = f"_batch{batch_num:03d}" if batch_num is not None else ""
+    filename = f"parsed_{pattern}_{timestamp}{suffix}.jsonl"
     body = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
     if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
         path = os.path.join(output_dir, filename)
         with open(path, "w", encoding="utf-8") as f:
             f.write(body + "\n")
@@ -587,11 +595,29 @@ def _write_parsed(records: list[dict], pattern: str, timestamp: str, output_dir:
         logger.info(f"Wrote {len(records)} {pattern} records to S3: {key}")
 
 
+def _load_processed_slugs(path: str | None) -> set[str]:
+    """Read the set of already-parsed PDF slugs from a plain-text file (one per line)."""
+    if not path or not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def _append_processed_slugs(path: str | None, slugs: list[str]) -> None:
+    """Append newly-parsed PDF slugs to the processed-list file (after their batch is durable)."""
+    if not path or not slugs:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(slugs) + "\n")
+
+
 def run_centralise_parse(
     cis: str | None = None,
     pdf_path: str | None = None,
     output_dir: str | None = None,
     limite: int | None = None,
+    batch_size: int = 500,
+    processed_file: str | None = None,
 ) -> None:
     """Parse centralised EMA PDFs into RCP + Notice JSONL, one line per CIS.
 
@@ -600,13 +626,16 @@ def run_centralise_parse(
     presentations once, and matches each CIS to its own via ``SpecDenom01``.
     ``--pdf`` parses a single local file and emits every presentation for
     inspection (writes locally) — for prototyping.
+
+    Worklist mode flushes output every ``batch_size`` records so a crash keeps
+    completed batches. With ``processed_file`` set, parsed PDF slugs are recorded
+    there after each flush and skipped on a re-run, so an interrupted run resumes
+    without re-parsing.
     """
     from .centralise.match import match_presentation
     from .centralise.parser import assemble_document, parse_pdf
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rcp_lines: list[dict] = []
-    notice_lines: list[dict] = []
 
     def record(doc: dict, filename: str, cis_code: str, title: str) -> dict:
         return {
@@ -619,38 +648,68 @@ def run_centralise_parse(
             raise ValueError("--pdf requires --cis to tag the output record")
         res = parse_pdf(Path(pdf_path).read_bytes())
         filename = os.path.basename(pdf_path)
-        rcp_lines += [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
-        notice_lines += [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
+        rcp_lines = [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
+        notice_lines = [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
         output_dir = output_dir or "."  # prototyping: default to local cwd
-    else:
-        from .centralise.acquire import get_ema_pdf, pdf_cache_key
-        from .db import get_centralised_worklist
+        logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
+        _write_parsed(rcp_lines, "R", timestamp, output_dir)
+        _write_parsed(notice_lines, "N", timestamp, output_dir)
+        return
 
-        s3_client = make_s3_client()
-        worklist = get_centralised_worklist(cis=cis)
-        urls = list(worklist)
-        if limite is not None:
-            urls = urls[:limite]
-        logger.info(f"{len(urls)} distinct PDF(s) to parse")
+    from .centralise.acquire import get_ema_pdf, pdf_cache_key
+    from .db import get_centralised_worklist
 
-        for url in tqdm(urls, desc="PDFs", unit="pdf"):
-            try:
-                res = parse_pdf(get_ema_pdf(url, s3_client))
-                filename = pdf_cache_key(url).split("/")[-1]
-                for cis_code, denom in worklist[url]:
-                    rcp_doc = match_presentation(denom, res["rcp"])
-                    notice_doc = match_presentation(denom, res["notice"])
-                    title = denom or (rcp_doc or notice_doc or {}).get("denomination", "")
-                    if rcp_doc:
-                        rcp_lines.append(record(rcp_doc, filename, cis_code, title))
-                    if notice_doc:
-                        notice_lines.append(record(notice_doc, filename, cis_code, title))
-            except Exception as e:
-                logger.error(f"Failed to parse {url}: {e}")
+    s3_client = make_s3_client()
+    worklist = get_centralised_worklist(cis=cis)
+    urls = list(worklist)
+    if limite is not None:
+        urls = urls[:limite]
 
-    logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
-    _write_parsed(rcp_lines, "R", timestamp, output_dir)
-    _write_parsed(notice_lines, "N", timestamp, output_dir)
+    already_done = _load_processed_slugs(processed_file)
+    if already_done:
+        logger.info(f"{len(already_done)} PDF(s) already processed (from {processed_file}); skipping those")
+
+    rcp_lines: list[dict] = []
+    notice_lines: list[dict] = []
+    pending_slugs: list[str] = []  # slugs buffered but not yet flushed to durable storage
+    batch_num = 0
+    total_rcp = total_notice = 0
+
+    def flush() -> None:
+        nonlocal batch_num, total_rcp, total_notice, rcp_lines, notice_lines, pending_slugs
+        if not rcp_lines and not notice_lines:
+            return
+        batch_num += 1
+        _write_parsed(rcp_lines, "R", timestamp, output_dir, batch_num=batch_num)
+        _write_parsed(notice_lines, "N", timestamp, output_dir, batch_num=batch_num)
+        _append_processed_slugs(processed_file, pending_slugs)  # only after the batch is written
+        total_rcp += len(rcp_lines)
+        total_notice += len(notice_lines)
+        rcp_lines, notice_lines, pending_slugs = [], [], []
+
+    todo = [u for u in urls if pdf_cache_key(u).split("/")[-1] not in already_done]
+    logger.info(f"{len(todo)} distinct PDF(s) to parse ({len(urls) - len(todo)} skipped)")
+
+    for url in tqdm(todo, desc="PDFs", unit="pdf"):
+        try:
+            res = parse_pdf(get_ema_pdf(url, s3_client))
+            filename = pdf_cache_key(url).split("/")[-1]
+            for cis_code, denom in worklist[url]:
+                rcp_doc = match_presentation(denom, res["rcp"])
+                notice_doc = match_presentation(denom, res["notice"])
+                title = denom or (rcp_doc or notice_doc or {}).get("denomination", "")
+                if rcp_doc:
+                    rcp_lines.append(record(rcp_doc, filename, cis_code, title))
+                if notice_doc:
+                    notice_lines.append(record(notice_doc, filename, cis_code, title))
+            pending_slugs.append(filename)
+            if len(rcp_lines) >= batch_size or len(notice_lines) >= batch_size:
+                flush()  # flush at a PDF boundary so a slug is only recorded once its records are durable
+        except Exception as e:
+            logger.error(f"Failed to parse {url}: {e}")
+
+    flush()  # final partial batch
+    logger.info(f"Parsed {total_rcp} RCP + {total_notice} Notice record(s) in {batch_num} batch(es)")
 
 
 def run_index_sections(
@@ -803,6 +862,13 @@ Environment variables for database:
         "--output-dir", "-o", help="Write parsed_R/N_*.jsonl locally to this dir (default: S3)"
     )
     centralise_parse_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to parse")
+    centralise_parse_parser.add_argument(
+        "--batch-size", type=int, default=500, help="Records per output JSONL batch file (default: 500)"
+    )
+    centralise_parse_parser.add_argument(
+        "--processed-file",
+        help="Text file of already-parsed PDF slugs; parsed PDFs are appended here and skipped on re-run",
+    )
 
     # Index into OpenSearch (subcommand group)
     os_parser = subparsers.add_parser("index-opensearch", help="Index data into OpenSearch")
@@ -968,7 +1034,14 @@ Environment variables for database:
                 raise SystemExit(1)
         elif args.target == "parse":
             try:
-                run_centralise_parse(cis=args.cis, pdf_path=args.pdf, output_dir=args.output_dir, limite=args.limite)
+                run_centralise_parse(
+                    cis=args.cis,
+                    pdf_path=args.pdf,
+                    output_dir=args.output_dir,
+                    limite=args.limite,
+                    batch_size=args.batch_size,
+                    processed_file=args.processed_file,
+                )
             except Exception as e:
                 logger.exception(f"Error: {e}")
                 raise SystemExit(1)

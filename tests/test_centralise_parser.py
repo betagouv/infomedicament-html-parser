@@ -45,7 +45,7 @@ def _find(nodes, prefix, heading_type):
 def _iter_all(nodes):
     for n in nodes:
         yield n
-        if n.get("type") != "table":  # importer does not recurse into table children
+        if n.get("type") != "table":  # mirror the importer's is_table guard (only literal "table" is skipped)
             yield from _iter_all(n.get("children", []))
 
 
@@ -200,13 +200,17 @@ class TestMetadataAndTables:
         assert content[0] == {"type": "AmmAnnexeTitre", "content": "MY TITLE"}
         assert content[1] == {"type": "DateNotif", "content": "07/2020"}
 
-    def test_table_rendered_as_html_in_section_4_8(self, rcp):
+    def test_table_rendered_in_section_4_8(self, rcp):
         section4 = _find(rcp, "4.", "AmmAnnexeTitre1")
         s48 = _find(section4["children"], "4.8", "AmmAnnexeTitre2")
-        tables = [c for c in s48["children"] if c.get("type") == "table"]
+        tables = [c for c in s48["children"] if c.get("type") == "AmmCorpsTexteTable"]
         assert tables
-        assert tables[0]["html"].startswith("<table>")
-        assert tables[0]["children"]  # truthy so the importer keeps it
+        # The frontend renders from the children tree: tr -> td, cell text in `content`.
+        rows = tables[0]["children"]
+        assert rows and rows[0]["tag"] == "tr"
+        cells = rows[0]["children"]
+        assert cells and cells[0]["tag"] == "td"
+        assert isinstance(cells[0]["content"], list) and cells[0]["content"][0]
 
 
 class TestImporterContract:
@@ -222,5 +226,5 @@ class TestImporterContract:
         for kind in ("rcp", "notice"):
             for doc in parsed[kind]:
                 for node in _iter_all(doc["content"]):
-                    if node.get("type") == "table":
+                    if node.get("type") == "AmmCorpsTexteTable":
                         assert node.get("html")

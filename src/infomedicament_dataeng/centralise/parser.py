@@ -119,7 +119,9 @@ class _NodeBuilder:
     def add(self, el) -> None:
         if isinstance(el, Table):
             self._flush()
-            self._sink().append({"type": "table", "tag": "table", "html": el.html, "children": el.children})
+            self._sink().append(
+                {"type": "AmmCorpsTexteTable", "tag": "table", "html": el.html, "children": el.children}
+            )
             self._prev_y1, self._prev_page = el.y0, el.page
             return
 
