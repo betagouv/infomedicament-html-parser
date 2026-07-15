@@ -228,3 +228,30 @@ class TestImporterContract:
                 for node in _iter_all(doc["content"]):
                     if node.get("type") == "AmmCorpsTexteTable":
                         assert node.get("html")
+
+
+def _image_nodes(parsed):
+    nodes = []
+    for kind in ("rcp", "notice"):
+        for doc in parsed[kind]:
+            nodes += [n for n in _iter_all(doc["content"]) if "<img" in (n.get("html") or "")]
+    return nodes
+
+
+class TestImages:
+    def test_blobs_extracted_and_content_addressed(self, parsed):
+        images = parsed["images"]
+        assert images  # the Abasaglar notices carry injection diagrams
+        for key in images:
+            assert key.startswith("exports/images/centralise/")  # default image_prefix
+
+    def test_image_nodes_reference_uploaded_blobs(self, parsed):
+        nodes = _image_nodes(parsed)
+        assert nodes
+        keys = parsed["images"]
+        for n in nodes:
+            # rendered via html (fix-notice-img), with truthy content so the importer keeps it
+            assert n["type"] == "AmmCorpsTexte"
+            assert n.get("content")
+            sha = n["html"].split("/centralise/")[1].split('"')[0].rsplit(".", 1)[0]
+            assert any(sha in k for k in keys), "image URL must point at an uploaded blob"

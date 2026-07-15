@@ -7,13 +7,15 @@ Emits the same node shapes the importer consumes (see the plan / ``db.py``):
 authoritative maps in ``opensearch.sections`` (no duplication).
 """
 
+import hashlib
 import html
 import re
 
 import fitz
 
+from ..config import get_config
 from ..opensearch.sections import _NOTICE_NUMBER_TO_ANCHOR, _RCP_NUMBER_TO_ANCHOR
-from .extract import Table, TextLine, extract_elements
+from .extract import Image, Table, TextLine, extract_elements
 
 # Heading patterns (applied only to bold lines). L2 is tried before L1.
 _RCP_L2 = re.compile(r"^(\d{1,2}\.\d{1,2})\.?\s+(.+)$")
@@ -42,8 +44,11 @@ def _is_notice_header(text: str) -> bool:
 class _NodeBuilder:
     """Accumulate ordered elements into a nested content node-list."""
 
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, cdn_base_url: str, image_prefix: str, images: dict[str, bytes]):
         self.kind = kind  # "rcp" | "notice"
+        self.cdn_base_url = cdn_base_url  # e.g. ".../exports/images"
+        self.image_prefix = image_prefix  # S3 key prefix, e.g. "exports/images/"
+        self.images = images  # shared sha-keyed blob map, uploaded to the CDN by the caller
         self.root: list[dict] = []
         self.titre1: dict | None = None
         self.titre2: dict | None = None
@@ -125,6 +130,12 @@ class _NodeBuilder:
             self._prev_y1, self._prev_page = el.y0, el.page
             return
 
+        if isinstance(el, Image):
+            self._flush()
+            self._sink().append(self._image_node(el))
+            self._prev_y1, self._prev_page = el.y0, el.page
+            return
+
         assert isinstance(el, TextLine)
         text = el.text
         gap = el.y0 - self._prev_y1 if (self._prev_page == el.page and self._prev_y1 is not None) else 1e9
@@ -178,6 +189,24 @@ class _NodeBuilder:
                         self.date_notif = m.group(0)
                         return
 
+    def _image_node(self, el: Image) -> dict:
+        """Register the blob for upload and return an ANSM-style image node.
+
+        Mirrors the ANSM shape: the ``<img>`` lives in the ``html`` field (which the
+        frontend renders). That renderer is only reached when ``content`` is also
+        truthy, and the importer drops content-less nodes — hence the space in
+        ``content`` (unused: the html branch renders first).
+        """
+        sha = hashlib.sha256(el.data).hexdigest()
+        ext = el.ext or "png"
+        self.images[f"{self.image_prefix}centralise/{sha}.{ext}"] = el.data
+        url = f"{self.cdn_base_url}/centralise/{sha}.{ext}"
+        return {
+            "type": "AmmCorpsTexte",
+            "content": " ",
+            "html": f'<p><img src="{url}" alt="" style="max-width:100%"/></p>',
+        }
+
 
 def _rcp_denomination(body: list[dict]) -> str:
     """RCP denomination = the body text under section 1 (used to match a CIS).
@@ -219,13 +248,14 @@ def _find_annexe1_range(doc: fitz.Document) -> range | None:
 def _find_notice_ranges(doc: fitz.Document) -> list[range]:
     """Page range of each ANNEXE III.B notice (one per presentation).
 
-    A notice runs from its 'Notice: … utilisateur' header to the 'La dernière
-    date … cette notice a été révisée' marker (inclusive), bounded by the next
-    header. The 'ce manuel a été révisé' marker is ignored (device manual).
+    A notice runs from its 'Notice: … information' header to just before the next
+    such header (or the end of the document for the last one). This deliberately
+    includes the illustrated 'Manuel d'utilisation' (instructions-for-use) that
+    follows the notice text — its injection diagrams are part of the leaflet.
+    The revision date inside the notice is still captured by the node builder.
     """
     b_notice = None
     headers: list[int] = []
-    revisions: list[int] = []
     for pno in range(doc.page_count):
         for text, bold in _bold_lines(doc[pno]):
             if not bold:
@@ -234,14 +264,11 @@ def _find_notice_ranges(doc: fitz.Document) -> list[range]:
                 b_notice = pno
             if b_notice is not None and _is_notice_header(text):
                 headers.append(pno)
-            if text.startswith("La dernière date") and "notice" in text:
-                revisions.append(pno)
 
     ranges: list[range] = []
     for i, header in enumerate(headers):
         nxt = headers[i + 1] if i + 1 < len(headers) else doc.page_count
-        rev = next((r for r in revisions if header <= r < nxt), None)
-        ranges.append(range(header, (rev + 1) if rev is not None else nxt))
+        ranges.append(range(header, nxt))
     return ranges
 
 
@@ -272,9 +299,11 @@ def _split_smpcs(elements: list) -> list[list]:
     return groups
 
 
-def _build_body(elements: list, kind: str) -> tuple[list[dict], str]:
+def _build_body(
+    elements: list, kind: str, images: dict, cdn_base_url: str, image_prefix: str
+) -> tuple[list[dict], str]:
     """Run the node builder over one presentation's elements; return (body, date)."""
-    builder = _NodeBuilder(kind)
+    builder = _NodeBuilder(kind, cdn_base_url, image_prefix, images)
     for el in elements:
         builder.add(el)
     return builder.finish(), builder.date_notif
@@ -291,22 +320,27 @@ def assemble_document(body: list[dict], title: str, date_notif: str) -> list[dic
     return content
 
 
-def parse_pdf(pdf_bytes: bytes) -> dict[str, list[dict]]:
+def parse_pdf(pdf_bytes: bytes) -> dict:
     """Parse an EMA PI PDF into all its RCP and Notice presentations.
 
-    Returns ``{"rcp": [doc, …], "notice": [doc, …]}`` where each ``doc`` is
-    ``{"denomination": str, "date_notif": str, "content": [body nodes]}``. One
-    PDF bundles one presentation per device (cartouche, pen, …); the caller
-    matches each CIS to its presentation (see ``match.py``) and prepends the
-    metadata via ``assemble_document``.
+    Returns ``{"rcp": [doc, …], "notice": [doc, …], "images": {s3_key: bytes}}``
+    where each ``doc`` is ``{"denomination": str, "date_notif": str, "content":
+    [body nodes]}``. One PDF bundles one presentation per device (cartouche, pen,
+    …); the caller matches each CIS to its presentation (see ``match.py``),
+    prepends the metadata via ``assemble_document``, and uploads ``images`` to
+    the CDN (they are content-addressed, so uploads are idempotent).
     """
+    cfg = get_config()
+    cdn_base_url, image_prefix = cfg.cdn_base_url, cfg.s3.image_prefix
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    result: dict[str, list[dict]] = {"rcp": [], "notice": []}
+    images: dict[str, bytes] = {}
+    result: dict = {"rcp": [], "notice": [], "images": images}
 
     annexe1 = _find_annexe1_range(doc)
     if annexe1 is not None:
         for group in _split_smpcs(extract_elements(doc, annexe1)):
-            body, date_notif = _build_body(group, "rcp")
+            body, date_notif = _build_body(group, "rcp", images, cdn_base_url, image_prefix)
             if body:
                 result["rcp"].append(
                     {"denomination": _rcp_denomination(body), "date_notif": date_notif, "content": body}
@@ -314,7 +348,7 @@ def parse_pdf(pdf_bytes: bytes) -> dict[str, list[dict]]:
 
     for rng in _find_notice_ranges(doc):
         elements = extract_elements(doc, rng)
-        body, date_notif = _build_body(elements, "notice")
+        body, date_notif = _build_body(elements, "notice", images, cdn_base_url, image_prefix)
         if body:
             result["notice"].append(
                 {"denomination": _notice_denomination(elements), "date_notif": date_notif, "content": body}

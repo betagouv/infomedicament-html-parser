@@ -42,6 +42,19 @@ class Table:
     y0: float
 
 
+@dataclass
+class Image:
+    data: bytes  # raw embedded image bytes (uploaded to the CDN by the caller)
+    ext: str  # "png" / "jpeg" / …
+    page: int
+    y0: float
+
+
+# Ignore tiny embedded bitmaps (icons, separators, soft masks); real QRD figures
+# are far larger (the smallest injection-diagram in our fixtures is ~108px).
+_MIN_IMAGE_PX = 32
+
+
 def _clean_cell(cell) -> str:
     return " ".join((cell or "").split())
 
@@ -120,6 +133,22 @@ def extract_elements(doc: fitz.Document, page_range: range) -> list:
             rows = t.extract()
             page_elems.append(Table(html=_table_to_html(rows), children=_table_children(rows), page=pno, y0=rect.y0))
 
+        page_elems.extend(_page_images(doc, page, pno))
+
         page_elems.sort(key=lambda e: e.y0)
         elements.extend(page_elems)
     return elements
+
+
+def _page_images(doc: fitz.Document, page: fitz.Page, pno: int) -> list:
+    """Extract embedded images on a page as positioned ``Image`` elements."""
+    out: list = []
+    for img in page.get_images(full=True):
+        xref = img[0]
+        info = doc.extract_image(xref)
+        data = info.get("image")
+        if not data or info.get("width", 0) < _MIN_IMAGE_PX or info.get("height", 0) < _MIN_IMAGE_PX:
+            continue
+        for rect in page.get_image_rects(xref):
+            out.append(Image(data=data, ext=info.get("ext", "png"), page=pno, y0=rect.y0))
+    return out

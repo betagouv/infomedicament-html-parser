@@ -91,6 +91,7 @@ class TestParseFanOut:
         parsed = {
             "rcp": [_doc("… en cartouche", "rcp-cartouche"), _doc("… KwikPen … stylo prérempli", "rcp-pen")],
             "notice": [_doc("… en cartouche", "notice-cartouche"), _doc("… KwikPen … stylo prérempli", "notice-pen")],
+            "images": {},
         }
 
         monkeypatch.setattr(cli, "make_s3_client", lambda: object())

@@ -611,6 +611,19 @@ def _append_processed_slugs(path: str | None, slugs: list[str]) -> None:
         f.write("\n".join(slugs) + "\n")
 
 
+def _upload_images(s3_client, images: dict) -> int:
+    """Upload content-addressed images to the CDN prefix, skipping ones already there."""
+    uploaded = 0
+    for key, data in images.items():
+        if s3_client.object_exists(key):
+            continue
+        ext = key.rsplit(".", 1)[-1].lower()
+        content_type = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+        s3_client.upload_file_content(key, data, content_type=content_type)
+        uploaded += 1
+    return uploaded
+
+
 def run_centralise_parse(
     cis: str | None = None,
     pdf_path: str | None = None,
@@ -651,6 +664,8 @@ def run_centralise_parse(
         rcp_lines = [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
         notice_lines = [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
         output_dir = output_dir or "."  # prototyping: default to local cwd
+        if res["images"]:
+            logger.info(f"{len(res['images'])} image(s) referenced (not uploaded in --pdf mode)")
         logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
         _write_parsed(rcp_lines, "R", timestamp, output_dir)
         _write_parsed(notice_lines, "N", timestamp, output_dir)
@@ -673,7 +688,7 @@ def run_centralise_parse(
     notice_lines: list[dict] = []
     pending_slugs: list[str] = []  # slugs buffered but not yet flushed to durable storage
     batch_num = 0
-    total_rcp = total_notice = 0
+    total_rcp = total_notice = total_images = 0
 
     def flush() -> None:
         nonlocal batch_num, total_rcp, total_notice, rcp_lines, notice_lines, pending_slugs
@@ -693,6 +708,7 @@ def run_centralise_parse(
     for url in tqdm(todo, desc="PDFs", unit="pdf"):
         try:
             res = parse_pdf(get_ema_pdf(url, s3_client))
+            total_images += _upload_images(s3_client, res["images"])  # before records reference them
             filename = pdf_cache_key(url).split("/")[-1]
             for cis_code, denom in worklist[url]:
                 rcp_doc = match_presentation(denom, res["rcp"])
@@ -709,7 +725,10 @@ def run_centralise_parse(
             logger.error(f"Failed to parse {url}: {e}")
 
     flush()  # final partial batch
-    logger.info(f"Parsed {total_rcp} RCP + {total_notice} Notice record(s) in {batch_num} batch(es)")
+    logger.info(
+        f"Parsed {total_rcp} RCP + {total_notice} Notice record(s) in {batch_num} batch(es); "
+        f"uploaded {total_images} new image(s)"
+    )
 
 
 def run_index_sections(
