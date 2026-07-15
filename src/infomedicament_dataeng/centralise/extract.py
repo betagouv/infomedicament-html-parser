@@ -37,7 +37,7 @@ class TextLine:
 @dataclass
 class Table:
     html: str
-    children: list  # row/cell tree; not stored, but required for the importer guard
+    children: list  # row/cell tree, stored by the importer and rendered by the frontend
     page: int
     y0: float
 
@@ -59,11 +59,14 @@ def _table_to_html(rows: list[list]) -> str:
 
 
 def _table_children(rows: list[list]) -> list:
-    """Row/cell tree mirroring html_vers_json; kept only so the node passes the
-    importer's truthiness guard (table children are ignored on insert)."""
-    return [
-        {"tag": "tr", "children": [{"tag": "td", "text": _clean_cell(c), "children": []} for c in row]} for row in rows
-    ]
+    """Row/cell tree consumed by the frontend table renderer (getTableElement).
+
+    Each ``td`` carries its text in ``content`` (a string list) — that is the
+    field the frontend reads for a cell, and the field the search indexer picks
+    up. The importer stores these children because the table node's type is
+    ``AmmCorpsTexteTable`` (not ``table``), so its ``is_table`` guard recurses.
+    """
+    return [{"tag": "tr", "children": [{"tag": "td", "content": [_clean_cell(c)]} for c in row]} for row in rows]
 
 
 def _merge_same_line(lines: list[TextLine]) -> list[TextLine]:
