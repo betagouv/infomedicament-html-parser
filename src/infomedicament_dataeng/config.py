@@ -2,7 +2,12 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
 
 
 @dataclass

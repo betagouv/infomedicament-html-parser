@@ -51,6 +51,51 @@ poetry run infomedicament-dataeng local ./html_files -o output.jsonl --pattern N
 poetry run infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
 ```
 
+#### Local Semantic Document Mode
+
+Convert local `N*.htm` notices and `R*.htm` RCPs to sanitized, render-ready semantic HTML without database access:
+
+```bash
+poetry run infomedicament-dataeng semantic-local ./html_files \
+  --output semantic_output.jsonl \
+  --limit 10
+```
+
+Options:
+- `--output, -o`: Output JSONL file (default: `semantic_output.jsonl`)
+- `--limit`: Limit the number of documents processed
+- `--pattern`: Select `N`, `R`, or `all` documents (default: `all`)
+- `--image-base-url`: HTTPS base URL used to rewrite relative document images
+
+Each JSONL record contains `source.filename`, ISO `date_notif`, plain-text
+`indication`, and sanitized `content_html`. The indication block is also marked
+with `data-document-role="indication"` in the semantic HTML.
+
+#### Experimental semantic S3 import
+
+Parse Notice or RCP HTML from S3 with the semantic parser and write the result
+directly to PostgreSQL:
+
+```bash
+poetry run infomedicament-dataeng semantic-s3-import --pattern N --staging --limit 10
+poetry run infomedicament-dataeng semantic-s3-import --pattern R --staging --limit 10
+poetry run infomedicament-dataeng semantic-s3-import --pattern N --cis 61234567
+poetry run infomedicament-dataeng semantic-s3-import --pattern R --cis 61234567
+```
+
+`N` writes `notices.content_html`; `R` writes `rcp.content_html`. Omit
+`--staging` to process the corresponding main prefix. This command does not
+create JSONL files and never moves staged source files. `--cis` restricts the
+update to one CIS; without it, all authorized CIS codes are processed as before.
+The command updates `content_html` and replaces `dateNotif` with the date extracted from the HTML;
+the legacy parser's `title` and `children` fields remain unchanged. For notices,
+it also writes the extracted indication to `specialites_metadata.description`
+where the CIS matches. RCP imports do not update that metadata table. The
+`content_html` column must exist on the selected document table before running
+the command. Terms whose `ref_glossaire.a_souligner` value is true are wrapped
+as `<span data-definition="Canonical glossary name">…</span>` so the frontend
+can attach an interactive definition UI.
+
 #### S3 Mode
 
 Process HTML files from S3 (Clever Cloud Cellar) and write results back to S3:

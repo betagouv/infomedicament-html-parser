@@ -49,6 +49,21 @@ def get_cis_atc_mapping(config: PostgresConfig | None = None) -> dict[str, str]:
         return {str(row[0]): row[1] for row in result.fetchall()}
 
 
+def get_glossary_terms(config: PostgresConfig | None = None) -> list[str]:
+    """Return the distinct glossary names marked for annotation."""
+    engine = get_postgres_engine(config)
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(
+                "SELECT DISTINCT btrim(nom) AS nom "
+                "FROM ref_glossaire "
+                "WHERE a_souligner IS TRUE AND btrim(nom) <> '' "
+                "ORDER BY nom"
+            )
+        )
+        return list(result.scalars())
+
+
 def get_filename_to_cis_mapping(config: DatabaseConfig | None = None) -> dict[str, str]:
     """Retrieve the filename → CIS mapping from MySQL."""
     engine = get_mysql_engine(config)
@@ -232,6 +247,61 @@ def _import_one_record(conn, main_table: str, content_table: str, record: dict) 
             "children": children_ids or None,
         },
     )
+
+
+def _upsert_semantic_document(conn, table: str, record: dict) -> None:
+    """Upsert semantic HTML and extracted metadata for one document."""
+    if table not in {"notices", "rcp"}:
+        raise ValueError(f"Unsupported semantic document table: {table}")
+
+    cis = record.get("cis")
+    if not cis:
+        raise ValueError("Semantic document record is missing its CIS code")
+
+    conn.execute(
+        text(
+            f'INSERT INTO {table} ("codeCIS", content_html, "dateNotif")'
+            " VALUES (:cis, :content_html, :date_notif)"
+            ' ON CONFLICT ("codeCIS") DO UPDATE'
+            " SET content_html = EXCLUDED.content_html,"
+            ' "dateNotif" = EXCLUDED."dateNotif"'
+        ),
+        {
+            "cis": int(cis),
+            "content_html": record["content_html"],
+            "date_notif": record.get("date_notif"),
+        },
+    )
+
+    if table == "notices":
+        conn.execute(
+            text('UPDATE specialites_metadata SET description = :description WHERE "CIS" = :cis'),
+            {
+                "cis": int(cis),
+                "description": record.get("indication") or "",
+            },
+        )
+
+
+def import_semantic_documents(
+    records,
+    table: str,
+    config: PostgresConfig | None = None,
+) -> tuple[int, int]:
+    """Upsert semantic HTML into PostgreSQL, committing each document independently."""
+    engine = get_postgres_engine(config)
+    imported = 0
+    errors = 0
+    with engine.connect() as conn:
+        for record in records:
+            try:
+                _upsert_semantic_document(conn, table, record)
+                conn.commit()
+                imported += 1
+            except Exception:
+                conn.rollback()
+                errors += 1
+    return imported, errors
 
 
 def import_to_postgres(

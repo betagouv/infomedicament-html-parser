@@ -18,7 +18,13 @@ from .config import get_config
 from .convert import sql_to_csv
 from .datagouv import import_dataset, load_datasets
 from .datapackage_importer import import_datapackage
-from .db import get_authorized_cis, get_filename_to_cis_mapping, import_to_postgres
+from .db import (
+    get_authorized_cis,
+    get_filename_to_cis_mapping,
+    get_glossary_terms,
+    import_semantic_documents,
+    import_to_postgres,
+)
 from .io import charger_liste_cis
 from .opensearch.notice_chunks import DEFAULT_INDEX as NOTICE_CHUNKS_DEFAULT_INDEX
 from .opensearch.notice_chunks import index_from_local as index_notice_chunks_from_local
@@ -27,7 +33,7 @@ from .opensearch.sections import DEFAULT_INDEX as SECTIONS_DEFAULT_INDEX
 from .opensearch.sections import index_from_local, index_from_s3
 from .opensearch.specialites import DEFAULT_INDEX as SPECIALITES_DEFAULT_INDEX
 from .opensearch.specialites import index_specialites
-from .parsing import html_vers_json
+from .parsing import DEFAULT_IMAGE_BASE_URL, html_vers_json, parse_semantic_document
 from .s3 import make_s3_client
 
 logger = logging.getLogger(__name__)
@@ -65,6 +71,34 @@ def traiter_fichier_local(fichier_data: tuple) -> dict | None:
         data = html_vers_json(html)
 
         return {"source": {"filename": base, "cis": cis}, "content": data}
+
+    except Exception as e:
+        logger.error(f"Error processing {fichier}: {e}")
+        return None
+
+
+def traiter_fichier_semantic_local(fichier_data: tuple) -> dict | None:
+    """
+    Process a local notice or RCP HTML file into sanitized semantic HTML.
+
+    Args:
+        fichier_data: Tuple containing (file_path, image_base_url)
+
+    Returns:
+        Render-ready notice record or None if error
+    """
+    fichier, image_base_url = fichier_data
+
+    try:
+        base = os.path.basename(fichier)
+        document = parse_semantic_document(Path(fichier).read_bytes(), image_base_url=image_base_url)
+
+        return {
+            "source": {"filename": base},
+            "date_notif": document.date_notif.isoformat() if document.date_notif else None,
+            "indication": document.indication,
+            "content_html": document.content_html,
+        }
 
     except Exception as e:
         logger.error(f"Error processing {fichier}: {e}")
@@ -174,6 +208,139 @@ def traiter_dossier_local(
 
     logger.info(f"Processing complete: {files_processed} processed, {files_skipped} skipped")
     logger.info(f"Output: {fichier_sortie}")
+
+
+def traiter_dossier_semantic_local(
+    dossier_html: str,
+    fichier_sortie: str = "semantic_output.jsonl",
+    limite: int | None = None,
+    pattern: str = "all",
+    image_base_url: str = DEFAULT_IMAGE_BASE_URL,
+) -> None:
+    """
+    Process a local folder of notices and/or RCPs into semantic HTML JSONL.
+
+    Args:
+        dossier_html: Path to the folder containing HTML files
+        fichier_sortie: Output JSONL file
+        limite: Limit number of files to process
+        pattern: Document filename prefix: "N", "R", or "all"
+        image_base_url: Base URL used to rewrite relative image paths
+    """
+    if pattern not in {"N", "R", "all"}:
+        raise ValueError('pattern must be "N", "R", or "all"')
+    filename_pattern = "[NR]*.htm" if pattern == "all" else f"{pattern}*.htm"
+    fichiers = sorted(glob.glob(os.path.join(dossier_html, filename_pattern)))
+    if limite is not None:
+        fichiers = fichiers[:limite]
+
+    logger.info(f"{len(fichiers)} HTML files found")
+    logger.info("Semantic local mode")
+
+    fichiers_data = [(fichier, image_base_url) for fichier in fichiers]
+
+    with open(fichier_sortie, "w", encoding="utf-8") as f_out:
+        pass
+
+    files_processed = 0
+    files_failed = 0
+
+    with tqdm(total=len(fichiers_data), desc="Processing", unit="file") as pbar:
+        for fichier_data in fichiers_data:
+            result = traiter_fichier_semantic_local(fichier_data)
+            if result is not None:
+                with open(fichier_sortie, "a", encoding="utf-8") as f_out:
+                    f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
+                files_processed += 1
+            else:
+                files_failed += 1
+            pbar.set_postfix(processed=files_processed, failed=files_failed)
+            pbar.update(1)
+
+    logger.info(f"Semantic processing complete: {files_processed} processed, {files_failed} failed")
+    logger.info(f"Output: {fichier_sortie}")
+
+
+def import_semantic_documents_from_s3(
+    pattern: str = "N",
+    limite: int | None = None,
+    staging: bool = False,
+    image_base_url: str = DEFAULT_IMAGE_BASE_URL,
+    cis: str | None = None,
+) -> None:
+    """Parse documents from S3 and upsert their semantic HTML into PostgreSQL.
+
+    This experimental pipeline is deliberately independent from the legacy
+    JSONL pipeline. In particular, it never moves source files out of staging.
+    """
+    if pattern not in {"N", "R"}:
+        raise ValueError('pattern must be "N" or "R"')
+
+    s3_client = make_s3_client()
+    config = get_config()
+    table = "notices" if pattern == "N" else "rcp"
+
+    logger.info("Loading authorized CIS codes and filename mapping...")
+    cis_autorises = get_authorized_cis()
+    mapping = get_filename_to_cis_mapping()
+    glossary_terms = get_glossary_terms(config.postgres)
+    logger.info("Loaded %d glossary terms to annotate", len(glossary_terms))
+
+    if cis is not None:
+        cis = str(cis)
+        logger.info("Restricting semantic import to CIS %s", cis)
+
+    if staging:
+        keys = sorted(s3_client.list_staging_html_files(pattern))
+    else:
+        keys = sorted(s3_client.list_html_files(pattern))
+
+    candidates = []
+    skipped = 0
+    for key in keys:
+        filename = key.split("/")[-1]
+        mapped_cis = mapping.get(filename)
+        document_cis = str(mapped_cis) if mapped_cis is not None else ""
+        if not document_cis or document_cis not in cis_autorises or (cis is not None and document_cis != cis):
+            skipped += 1
+            continue
+        candidates.append((key, filename, document_cis))
+
+    if limite is not None:
+        candidates = candidates[:limite]
+
+    logger.info(f"{len(candidates)} semantic documents to process, {skipped} skipped before parsing")
+    parse_errors = 0
+
+    def parsed_records():
+        nonlocal parse_errors
+        for key, filename, cis in tqdm(candidates, desc="Semantic documents", unit="file"):
+            try:
+                source = s3_client.download_file_content(key)
+                document = parse_semantic_document(
+                    source,
+                    image_base_url=image_base_url,
+                    glossary_terms=glossary_terms,
+                )
+                yield {
+                    "cis": cis,
+                    "filename": filename,
+                    "date_notif": document.date_notif.isoformat() if document.date_notif else None,
+                    "indication": document.indication,
+                    "content_html": document.content_html,
+                }
+            except Exception as e:
+                logger.error(f"Error parsing {key}: {e}")
+                parse_errors += 1
+
+    imported, db_errors = import_semantic_documents(parsed_records(), table, config.postgres)
+    logger.info(
+        "Semantic import complete: %d imported, %d parse errors, %d database errors, %d skipped",
+        imported,
+        parse_errors,
+        db_errors,
+        skipped,
+    )
 
 
 def traiter_depuis_s3(
@@ -317,6 +484,49 @@ def traiter_depuis_s3(
             logger.info(f"Batch {batch_num + 1}: {len(batch_keys)} files moved to main prefix")
 
     logger.info(f"Processing complete: {total_processed} processed, {total_skipped} skipped")
+
+
+def telecharger_html_depuis_s3(
+    dossier_sortie: str,
+    limite: int | None = None,
+    pattern: str = "N",
+    staging: bool = False,
+) -> None:
+    """
+    Download raw HTML files from S3 into a local folder for parser testing.
+
+    Args:
+        dossier_sortie: Local output directory
+        limite: Maximum number of files to download
+        pattern: File pattern to process ("N" for Notices, "R" for RCP)
+        staging: If True, download files from the staging prefix
+    """
+    s3_client = make_s3_client()
+    output_dir = Path(dossier_sortie)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    keys = s3_client.list_staging_html_files(pattern) if staging else s3_client.list_html_files(pattern)
+    total_downloaded = 0
+
+    logger.info(f"Downloading HTML files for pattern '{pattern}' into {output_dir}")
+    if limite is not None:
+        logger.info(f"Limit: {limite} file(s)")
+
+    with tqdm(total=limite, desc="Downloading", unit="file") as pbar:
+        for key in keys:
+            if limite is not None and total_downloaded >= limite:
+                break
+
+            filename = s3_client.get_filename_from_key(key)
+            destination = output_dir / filename
+            content = s3_client.download_file_content(key)
+            destination.write_bytes(content)
+
+            total_downloaded += 1
+            pbar.update(1)
+            pbar.set_postfix(file=filename)
+
+    logger.info(f"Downloaded {total_downloaded} file(s) to {output_dir}")
 
 
 def run_pediatric_classification(
@@ -762,6 +972,12 @@ Examples:
   # Local mode with CIS file override
   infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
 
+  # Test the semantic document parser locally (no database required)
+  infomedicament-dataeng semantic-local ./html_files -o semantic_output.jsonl --limit 10
+
+  # Experimental semantic parser: S3 documents directly to PostgreSQL
+  infomedicament-dataeng semantic-s3-import --pattern N --staging --limit 10
+
   # S3 mode (production on Scalingo)
   infomedicament-dataeng s3 --pattern N
 
@@ -789,6 +1005,41 @@ Environment variables for database:
     local_parser.add_argument("--processes", type=int, default=None, help="Number of processes")
     local_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
 
+    # Local semantic HTML mode
+    semantic_parser = subparsers.add_parser(
+        "semantic-local", help="Process local notices and RCPs into semantic HTML JSONL"
+    )
+    semantic_parser.add_argument("dossier_html", help="Folder containing N*.htm and/or R*.htm files")
+    semantic_parser.add_argument("--output", "-o", default="semantic_output.jsonl", help="Output JSONL file")
+    semantic_parser.add_argument("--limit", type=int, help="Limit number of files to process")
+    semantic_parser.add_argument(
+        "--pattern", default="all", choices=["N", "R", "all"], help="Documents to process (default: all)"
+    )
+    semantic_parser.add_argument(
+        "--image-base-url",
+        default=DEFAULT_IMAGE_BASE_URL,
+        help="Base URL used to rewrite relative image paths",
+    )
+
+    # Experimental semantic parser: S3 directly to PostgreSQL
+    semantic_s3_parser = subparsers.add_parser(
+        "semantic-s3-import",
+        help="Parse S3 Notices/RCPs as semantic HTML and upsert content_html",
+    )
+    semantic_s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
+    semantic_s3_parser.add_argument("--cis", help="Process only the document for this CIS code")
+    semantic_s3_parser.add_argument("--limit", type=int, help="Limit number of documents processed")
+    semantic_s3_parser.add_argument(
+        "--staging",
+        action="store_true",
+        help="Read documents from staging without moving them",
+    )
+    semantic_s3_parser.add_argument(
+        "--image-base-url",
+        default=DEFAULT_IMAGE_BASE_URL,
+        help="Base URL used to rewrite relative document images",
+    )
+
     # S3 mode
     s3_parser = subparsers.add_parser("s3", help="Process from S3 (Clever Cloud Cellar)")
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
@@ -800,6 +1051,17 @@ Environment variables for database:
         "--staging",
         action="store_true",
         help="Process only files in the staging subdirectory and move them to the main prefix after parsing",
+    )
+
+    # Download HTML files from S3 for local testing
+    download_parser = subparsers.add_parser("download-html", help="Download raw HTML files from S3 locally")
+    download_parser.add_argument("output_dir", help="Local output directory")
+    download_parser.add_argument("--limite", type=int, help="Limit number of files to download")
+    download_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
+    download_parser.add_argument(
+        "--staging",
+        action="store_true",
+        help="Download files from the staging subdirectory",
     )
 
     # SQL to CSV mode
@@ -980,10 +1242,48 @@ Environment variables for database:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
 
+    elif args.command == "semantic-local":
+        try:
+            traiter_dossier_semantic_local(
+                args.dossier_html,
+                fichier_sortie=args.output,
+                limite=args.limit,
+                pattern=args.pattern,
+                image_base_url=args.image_base_url,
+            )
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "semantic-s3-import":
+        try:
+            import_semantic_documents_from_s3(
+                pattern=args.pattern,
+                limite=args.limit,
+                staging=args.staging,
+                image_base_url=args.image_base_url,
+                cis=args.cis,
+            )
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
     elif args.command == "sql-to-csv":
         try:
             output_path = Path(args.output) if args.output else None
             sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "download-html":
+        try:
+            telecharger_html_depuis_s3(
+                args.output_dir,
+                limite=args.limite,
+                pattern=args.pattern,
+                staging=args.staging,
+            )
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)

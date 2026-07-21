@@ -1,6 +1,6 @@
 """Tests for DB import utilities, converted from infomedicament JS tests."""
 
-from infomedicament_dataeng.db import _insert_content_blocks, get_clean_html
+from infomedicament_dataeng.db import _insert_content_blocks, _upsert_semantic_document, get_clean_html
 
 
 class TestGetCleanHTML:
@@ -121,3 +121,64 @@ class TestInsertContentBlocks:
         )
         # only the table itself is inserted, not the child cell
         assert len(conn.execute_calls) == 1
+
+
+def test_upsert_semantic_notice_writes_html_date_and_indication(fake_connection):
+    conn = fake_connection()
+
+    _upsert_semantic_document(
+        conn,
+        "notices",
+        {
+            "cis": "61234567",
+            "content_html": "<p>Notice</p>",
+            "date_notif": "2026-07-17",
+            "indication": "Traitement de la douleur.",
+        },
+    )
+
+    assert conn.execute_calls == [
+        {
+            "cis": 61234567,
+            "content_html": "<p>Notice</p>",
+            "date_notif": "2026-07-17",
+        },
+        {
+            "cis": 61234567,
+            "description": "Traitement de la douleur.",
+        },
+    ]
+
+
+def test_upsert_semantic_rcp_writes_html_and_date_without_updating_description(fake_connection):
+    conn = fake_connection()
+
+    _upsert_semantic_document(
+        conn,
+        "rcp",
+        {
+            "cis": "61234567",
+            "content_html": "<p>RCP</p>",
+            "date_notif": "2026-07-17",
+            "indication": "Must not be written",
+        },
+    )
+
+    assert conn.execute_calls == [
+        {
+            "cis": 61234567,
+            "content_html": "<p>RCP</p>",
+            "date_notif": "2026-07-17",
+        }
+    ]
+
+
+def test_upsert_semantic_document_rejects_unknown_table(fake_connection):
+    conn = fake_connection()
+
+    try:
+        _upsert_semantic_document(conn, "other", {"cis": "61234567", "content_html": "<p>Document</p>"})
+    except ValueError as error:
+        assert str(error) == "Unsupported semantic document table: other"
+    else:
+        raise AssertionError("Unknown semantic document table should be rejected")
