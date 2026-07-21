@@ -35,6 +35,8 @@ def s3_config():
         notice_prefix="imports/notice/",
         rcp_prefix="imports/rcp/",
         output_prefix="exports/parsed/",
+        ema_pdf_prefix="imports/ema_pdf/",
+        image_prefix="exports/images/",
     )
 
 
