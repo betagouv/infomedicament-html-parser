@@ -19,6 +19,7 @@ from .convert import sql_to_csv
 from .datagouv import import_dataset, load_datasets
 from .datapackage_importer import import_datapackage
 from .db import (
+    check_sequences,
     get_authorized_cis,
     get_filename_to_cis_mapping,
     get_glossary_terms,
@@ -676,7 +677,7 @@ def run_pediatric_classification(
         print(format_metrics(metrics))
 
 
-def db_import(pattern: str, limite: int | None = None, since: date | None = None) -> None:
+def db_import(pattern: str, limite: int | None = None, since: date | None = None, fail_fast: bool = False) -> None:
     """
     Import legacy-tree or semantic-HTML JSONL files from S3 into PostgreSQL.
 
@@ -684,11 +685,19 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
         pattern: "N" for Notices, "R" for RCP.
         limite: Limit total number of records imported (for testing).
         since: If provided, only import JSONL files dated on or after this date.
+        fail_fast: Abort on the first failing record, with its full traceback.
     """
     s3_client = make_s3_client()
     config = get_config()
     main_table = "notices" if pattern == "N" else "rcp"
     content_table = "notices_content" if pattern == "N" else "rcp_content"
+
+    for table, next_id, max_id, drifted in check_sequences([content_table], config=config.postgres):
+        if drifted:
+            logger.warning(
+                f"{table}: next id {next_id} but MAX(id)={max_id} — inserts will fail with"
+                f" duplicate key errors. Run: infomedicament-dataeng db-check --fix"
+            )
 
     logger.info(f"Listing parsed JSONL files for pattern '{pattern}' from S3...")
     jsonl_keys = list(s3_client.list_parsed_files(pattern, since=since))
@@ -733,14 +742,30 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
                 main_table,
                 content_table,
                 config.postgres,
+                fail_fast=fail_fast,
             )
             imported += legacy_imported
             db_errors += legacy_errors
         total_imported += imported
         total_errors += parse_errors + db_errors
-        logger.info(f"{key}: {imported} imported, {parse_errors + db_errors} errors")
+        level = logging.WARNING if (parse_errors + db_errors) else logging.INFO
+        logger.log(level, f"{key}: {imported} imported, {parse_errors + db_errors} errors")
 
     logger.info(f"Import complete: {total_imported} records imported, {total_errors} errors")
+
+
+def db_check(fix: bool = False) -> None:
+    """Report id-sequence drift on the import target tables, optionally repairing it."""
+    tables = ["notices_content", "rcp_content"]  # main tables key on codeCIS, no id sequence
+    rows = check_sequences(tables, fix=fix, config=get_config().postgres)
+
+    print(f"{'table':<20} {'next id':>12} {'max(id)':>12}  status")
+    for table, next_id, max_id, drifted in rows:
+        status = ("FIXED" if fix else "DRIFTED — inserts will fail") if drifted else "ok"
+        print(f"{table:<20} {next_id:>12} {max_id:>12}  {status}")
+
+    if any(d for *_, d in rows) and not fix:
+        print("\nRun with --fix to reset the sequences.")
 
 
 def run_import_datagouv(config_path: Path, dataset_name: str | None = None) -> None:
@@ -1116,6 +1141,14 @@ Environment variables for database:
         metavar="YYYY-MM-DD",
         help="Only import JSONL files whose filename timestamp is on or after this date",
     )
+    db_import_parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Abort on the first failing record and show its full traceback",
+    )
+
+    db_check_parser = subparsers.add_parser("db-check", help="Diagnose the import target tables (id sequence drift)")
+    db_check_parser.add_argument("--fix", action="store_true", help="Reset any drifted sequence to MAX(id)+1")
 
     # Import from data.gouv.fr mode
     datagouv_parser = subparsers.add_parser("import-datagouv", help="Import datasets from data.gouv.fr into PostgreSQL")
@@ -1245,6 +1278,10 @@ Environment variables for database:
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    # --verbose is for our own code; these libraries log a wall of DEBUG per request.
+    if args.verbose:
+        for noisy in ("boto3", "botocore", "s3transfer", "urllib3", "opensearch"):
+            logging.getLogger(noisy).setLevel(logging.INFO)
 
     if args.command == "local":
         try:
@@ -1322,7 +1359,14 @@ Environment variables for database:
 
     elif args.command == "db-import":
         try:
-            db_import(args.pattern, limite=args.limite, since=args.since)
+            db_import(args.pattern, limite=args.limite, since=args.since, fail_fast=args.fail_fast)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "db-check":
+        try:
+            db_check(fix=args.fix)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
