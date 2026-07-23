@@ -134,6 +134,123 @@ class TestMatching:
         matched = match_presentation("BRINTELLIX 20 mg, comprimé pelliculé", docs)
         assert "comprimé" in matched["denomination"]
 
+    def test_strength_beats_token_overlap(self):
+        # Humalog: the 100 U/mL SmPC bundles three devices, so its long denomination
+        # loses on Jaccard to the standalone 200 U/mL one. The strength is decisive.
+        docs = [
+            {
+                "denomination": (
+                    "Humalog 100 unités/mL solution injectable en flacon "
+                    "Humalog 100 unités/mL solution injectable en cartouche "
+                    "Humalog 100 unités/mL KwikPen solution injectable en stylo pré-rempli"
+                )
+            },
+            {"denomination": "Humalog 200 unités/mL KwikPen solution injectable en stylo pré-rempli"},
+        ]
+        name = "HUMALOG 100 UI/ml KWIKPEN, solution injectable en stylo pré-rempli"
+        assert "100 unités/mL KwikPen" in match_presentation(name, docs)["denomination"]
+
+    def test_pack_volume_is_not_a_strength(self):
+        # A shared "3 mL" pack volume must not rescue the wrong strength.
+        docs = [
+            {"denomination": "Humalog 100 unités/mL KwikPen 3 mL"},
+            {"denomination": "Humalog 200 unités/mL KwikPen 3 mL stylo pré-rempli"},
+        ]
+        matched = match_presentation("HUMALOG 100 UI/ml KWIKPEN 3 ml, stylo pré-rempli", docs)
+        assert "100 unités/mL" in matched["denomination"]
+
+    def test_thousands_separator_spellings_are_equivalent(self):
+        # PDBM writes "1000 UI"; the EMA PDFs write "1 000 UI" or "1.000 UI".
+        docs = [
+            {"denomination": "Esperoct 500 UI, poudre et solvant pour solution injectable"},
+            {"denomination": "Esperoct 1 000 UI, poudre et solvant pour solution injectable"},
+            {"denomination": "Ceprotin 1.000 UI/10 ml, poudre et solvant pour solution injectable"},
+        ]
+        assert "1 000 UI" in match_presentation("ESPEROCT 1000 UI, poudre et solvant", docs)["denomination"]
+        assert "1.000 UI" in match_presentation("CEPROTIN 1000 UI/10 ml, poudre et solvant", docs)["denomination"]
+
+    def test_decimal_separator_spellings_are_equivalent(self):
+        docs = [{"denomination": "Volibris 5 mg comprimés"}, {"denomination": "Volibris 2.5 mg comprimés"}]
+        assert "2.5 mg" in match_presentation("VOLIBRIS 2,5 mg, comprimés pelliculés", docs)["denomination"]
+
+    def test_trailing_zero_decimals_are_equivalent(self):
+        # PDBM writes "EXELON 3 mg"; the PDF writes "Exelon 3,0 mg".
+        docs = [{"denomination": "Exelon 1,5 mg gélule"}, {"denomination": "Exelon 3,0 mg gélule"}]
+        assert "3,0 mg" in match_presentation("EXELON 3 mg, gélule", docs)["denomination"]
+
+    def test_insulin_mix_brand_number_is_not_a_strength(self):
+        # "Mix 50 100 UI/ml" = brand number 50 + strength 100, not "50100".
+        docs = [
+            {"denomination": "Humalog Mix25 100 unités/mL KwikPen suspension injectable en stylo pré-rempli"},
+            {"denomination": "Humalog Mix50 100 unités/mL KwikPen suspension injectable en stylo pré-rempli"},
+        ]
+        matched = match_presentation("HUMALOG MIX 50 100 UI/ml KWIKPEN, suspension injectable", docs)
+        assert matched is not None and "Mix50" in matched["denomination"]
+
+    def test_mix_number_discriminates_at_equal_strength(self):
+        # Insuman Comb 15 and Comb 25 are different medicines at the same 40 UI/ml.
+        docs = [
+            {"denomination": "Insuman Comb 25 40 UI/ml suspension injectable en flacon"},
+            {"denomination": "Insuman Comb 15 40 UI/ml suspension injectable en flacon"},
+        ]
+        matched = match_presentation("INSUMAN COMB 15 40 UI/ml, suspension injectable en flacon", docs)
+        assert "Comb 15" in matched["denomination"]
+
+    def test_absent_mix_number_skips_the_cis(self):
+        # The EU PDF covers Comb 25/50 at 40 UI/ml but not Comb 15: skip, don't guess.
+        docs = [
+            {"denomination": "Insuman Comb 25 40 UI/ml suspension injectable en flacon"},
+            {"denomination": "Insuman Comb 50 40 UI/ml suspension injectable en flacon"},
+        ]
+        assert match_presentation("INSUMAN COMB 15 40 UI/ml, suspension injectable en flacon", docs) is None
+
+    def test_welded_mix_number_still_discriminates(self):
+        # PDBM spells it "MIX50", the PDF "Mix50" — no space, still a variant number.
+        docs = [
+            {"denomination": "Humalog Mix25 100 unités/mL suspension injectable en flacon"},
+            {"denomination": "Humalog Mix50 100 unités/mL suspension injectable en flacon"},
+        ]
+        matched = match_presentation("HUMALOG MIX50 100 UI/ml, suspension injectable en flacon", docs)
+        assert "Mix50" in matched["denomination"]
+
+    def test_welded_number_never_empties_the_shortlist(self):
+        # "B12" is part of the name; it must refine at most, never skip the CIS.
+        docs = [{"denomination": "Cyano 100 microgrammes, solution injectable"}]
+        assert match_presentation("CYANO B12 100 microgrammes, solution injectable", docs) is docs[0]
+
+    def test_number_welded_into_a_word_is_not_a_variant(self):
+        # "COVID-19" must not be read as a variant number and skip the CIS.
+        docs = [
+            {"denomination": "Spikevax 0,1 mg/ml, dispersion injectable"},
+            {"denomination": "Spikevax 0,2 mg/mL, dispersion injectable"},
+        ]
+        name = "SPIKEVAX 0,2 mg/mL, dispersion injectable. Vaccin à ARNm contre la COVID-19"
+        assert "0,2 mg" in match_presentation(name, docs)["denomination"]
+
+    def test_no_matching_strength_skips_the_cis(self):
+        # Celsentri 25 mg: the EU PDF only covers 150/300 mg. Serving those is worse
+        # than serving nothing, so the CIS is skipped.
+        docs = [
+            {"denomination": "CELSENTRI 150 mg comprimés pelliculés"},
+            {"denomination": "CELSENTRI 300 mg comprimés pelliculés"},
+        ]
+        assert match_presentation("CELSENTRI 25 mg, comprimé pelliculé", docs) is None
+
+    def test_single_presentation_of_wrong_strength_is_skipped(self):
+        docs = [{"denomination": "Foscan 1 mg/mL, solution injectable"}]
+        assert match_presentation("FOSCAN 4 mg/ml, solution injectable", docs) is None
+
+    def test_unextractable_denomination_is_not_dropped(self):
+        # Section 1 failed to parse: no strength on the candidate side, so the
+        # strength check stands down rather than silently discarding the content.
+        docs = [{"denomination": "", "content": ["…"]}]
+        assert match_presentation("TEPMETKO 225 mg comprimés pelliculés", docs) is docs[0]
+
+    def test_unreadable_strength_falls_back_to_overlap(self):
+        docs = [{"denomination": "Vaxo 1 mL seringue"}, {"denomination": "Vaxo 0,5 mL seringue préremplie"}]
+        matched = match_presentation("VAXO 0,5 ml, suspension injectable en seringue préremplie", docs)
+        assert "0,5 mL" in matched["denomination"]
+
     def test_single_doc_returned_unconditionally(self):
         only = {"denomination": "whatever", "content_html": "", "date_notif": None}
         assert match_presentation("unrelated name", [only]) is only

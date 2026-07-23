@@ -49,6 +49,9 @@ _MONTH_NUMBERS = {
 # Vertical gap (points) below which a line continues the current paragraph.
 _PARA_GAP = 6.0
 
+# Cap on the product-name lines collected under a notice header (before the INN).
+_MAX_DENOM_LINES = 12
+
 
 def _line_runs(line: TextLine) -> list[TextRun]:
     if line.runs is not None:
@@ -266,12 +269,28 @@ def _rcp_denomination(elements: list) -> str:
 
 
 def _notice_denomination(elements: list) -> str:
-    """Notice denomination = the product line right after the 'Notice: …' header."""
+    """Notice denomination = the product lines after the 'Notice: …' header.
+
+    One notice can cover several strengths, each on its own line (Exelon 1,5 / 3,0 /
+    4,5 / 6,0 mg), so all of them are joined — as ``_rcp_denomination`` does for
+    section 1. The block ends at the INN/boilerplate that follows the names.
+    """
     for i, el in enumerate(elements):
-        if isinstance(el, TextLine) and _is_notice_header(el.text):
-            for nxt in elements[i + 1 :]:
-                if isinstance(nxt, TextLine) and nxt.text.strip():
-                    return nxt.text.strip()
+        if not (isinstance(el, TextLine) and _is_notice_header(el.text)):
+            continue
+        names: list[str] = []
+        for nxt in elements[i + 1 :]:
+            if not isinstance(nxt, TextLine):
+                continue
+            text = nxt.text.strip()
+            if not text:
+                continue
+            if text.lower().startswith("veuillez lire") or _NOTICE_L1.match(text):
+                break
+            names.append(text)
+            if len(names) >= _MAX_DENOM_LINES:
+                break
+        return " ".join(names)
     return ""
 
 
