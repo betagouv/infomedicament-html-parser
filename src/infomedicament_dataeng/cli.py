@@ -678,7 +678,7 @@ def run_pediatric_classification(
 
 def db_import(pattern: str, limite: int | None = None, since: date | None = None) -> None:
     """
-    Import parsed JSONL files from S3 into PostgreSQL.
+    Import legacy-tree or semantic-HTML JSONL files from S3 into PostgreSQL.
 
     Args:
         pattern: "N" for Notices, "R" for RCP.
@@ -716,12 +716,26 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
                 logger.error(f"Failed to parse line {line_num} in {key}: {e}")
                 parse_errors += 1
 
-        imported, db_errors = import_to_postgres(
-            tqdm(records, desc="records", unit="rec", leave=False),
-            main_table,
-            content_table,
-            config.postgres,
-        )
+        semantic_records = [record for record in records if "content_html" in record]
+        legacy_records = [record for record in records if "content_html" not in record]
+        imported = db_errors = 0
+        if semantic_records:
+            semantic_imported, semantic_errors = import_semantic_documents(
+                tqdm(semantic_records, desc="semantic records", unit="rec", leave=False),
+                main_table,
+                config.postgres,
+            )
+            imported += semantic_imported
+            db_errors += semantic_errors
+        if legacy_records:
+            legacy_imported, legacy_errors = import_to_postgres(
+                tqdm(legacy_records, desc="records", unit="rec", leave=False),
+                main_table,
+                content_table,
+                config.postgres,
+            )
+            imported += legacy_imported
+            db_errors += legacy_errors
         total_imported += imported
         total_errors += parse_errors + db_errors
         logger.info(f"{key}: {imported} imported, {parse_errors + db_errors} errors")
@@ -762,47 +776,23 @@ def run_centralise_fetch(cis: str | None = None, refresh: bool = False, limite: 
     logger.info(f"{len(urls)} distinct PDF(s) to acquire (refresh={refresh})")
 
     acquired = 0
-    for url in tqdm(urls, desc="PDFs", unit="pdf"):
-        try:
-            # Warming the cache only needs a cheap existence check, not the bytes.
-            if not refresh and s3_client.object_exists(pdf_cache_key(url)):
-                logger.info(f"Already cached: {url} (shared by {len(worklist[url])} CIS)")
+    with tqdm(urls, desc="PDFs", unit="pdf") as pbar:
+        for url in pbar:
+            try:
+                # Warming the cache only needs a cheap existence check, not the bytes.
+                key = pdf_cache_key(url)
+                if not refresh and s3_client.object_exists(key):
+                    pbar.set_postfix_str(f"cache: {key.rsplit('/', 1)[-1]}")
+                    acquired += 1
+                    continue
+                pdf = get_ema_pdf(url, s3_client, refresh=refresh)
+                logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
                 acquired += 1
-                continue
-            pdf = get_ema_pdf(url, s3_client, refresh=refresh)
-            logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
-            acquired += 1
-            time.sleep(1.0)  # polite gap between real EMA hits to avoid 429s
-        except Exception as e:
-            logger.error(f"Failed to acquire {url}: {e}")
+                time.sleep(1.0)  # polite gap between real EMA hits to avoid 429s
+            except Exception as e:
+                logger.error(f"Failed to acquire {url}: {e}")
 
     logger.info(f"Acquisition complete: {acquired}/{len(urls)} PDFs cached")
-
-
-def _write_parsed(
-    records: list[dict], pattern: str, timestamp: str, output_dir: str | None, batch_num: int | None = None
-) -> None:
-    """Write fanned-out JSONL records for one pattern, to a local dir or S3.
-
-    When ``batch_num`` is given, the filename carries a ``_batchNNN`` suffix so a
-    long run flushes many files instead of one, keeping progress durable.
-    """
-    if not records:
-        logger.info(f"No {pattern} records to write")
-        return
-    suffix = f"_batch{batch_num:03d}" if batch_num is not None else ""
-    filename = f"parsed_{pattern}_{timestamp}{suffix}.jsonl"
-    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(body + "\n")
-        logger.info(f"Wrote {len(records)} {pattern} records to {path}")
-    else:
-        key = f"{get_config().s3.output_prefix}{filename}"
-        make_s3_client().upload_file_content(key, body, content_type="application/x-ndjson")
-        logger.info(f"Wrote {len(records)} {pattern} records to S3: {key}")
 
 
 def _load_processed_slugs(path: str | None) -> set[str]:
@@ -837,54 +827,76 @@ def _upload_images(s3_client, images: dict) -> int:
 def run_centralise_parse(
     cis: str | None = None,
     pdf_path: str | None = None,
-    output_dir: str | None = None,
     limite: int | None = None,
     batch_size: int = 500,
     processed_file: str | None = None,
 ) -> None:
-    """Parse centralised EMA PDFs into RCP + Notice JSONL, one line per CIS.
+    """Parse centralised EMA PDFs and upsert semantic HTML directly into PostgreSQL.
 
     A PDF bundles one presentation per device (cartouche, pen, …); worklist mode
     (default) fetches each distinct PDF via the S3 cache, parses all its
     presentations once, and matches each CIS to its own via ``SpecDenom01``.
-    ``--pdf`` parses a single local file and emits every presentation for
-    inspection (writes locally) — for prototyping.
+    ``--pdf`` parses a local file, matches the requested ``--cis``, and imports
+    that presentation directly.
 
-    Worklist mode flushes output every ``batch_size`` records so a crash keeps
-    completed batches. With ``processed_file`` set, parsed PDF slugs are recorded
-    there after each flush and skipped on a re-run, so an interrupted run resumes
-    without re-parsing.
+    Records are imported every ``batch_size`` matched documents. Each database
+    document commits independently. With ``processed_file`` set, PDF slugs are
+    recorded only after their whole batch imports without database errors.
     """
     from .centralise.match import match_presentation
-    from .centralise.parser import assemble_document, parse_pdf
+    from .centralise.parser import parse_pdf
+    from .db import get_centralised_worklist
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    def record(doc: dict, filename: str, cis_code: str, title: str) -> dict:
+    def record(doc: dict, filename: str, cis_code: str) -> dict:
         return {
-            "source": {"filename": filename, "cis": cis_code, "denomination": doc["denomination"]},
-            "content": assemble_document(doc["content"], title, doc["date_notif"]),
+            "cis": cis_code,
+            "filename": filename,
+            "date_notif": doc["date_notif"],
+            "indication": doc["indication"],
+            "content_html": doc["content_html"],
         }
+
+    config = get_config()
+    s3_client = make_s3_client()
+    glossary_terms = get_glossary_terms(config.postgres)
+    logger.info("Loaded %d glossary terms to annotate", len(glossary_terms))
 
     if pdf_path:
         if not cis:
-            raise ValueError("--pdf requires --cis to tag the output record")
-        res = parse_pdf(Path(pdf_path).read_bytes())
+            raise ValueError("--pdf requires --cis to match and import the correct presentation")
+        worklist = get_centralised_worklist(cis=cis)
+        cis_row = next((row for rows in worklist.values() for row in rows if str(row[0]) == str(cis)), None)
+        if cis_row is None:
+            raise ValueError(f"No centralised medicine found for CIS {cis}")
+        denomination = cis_row[1]
+        res = parse_pdf(Path(pdf_path).read_bytes(), glossary_terms=glossary_terms)
+        uploaded = _upload_images(s3_client, res["images"])
         filename = os.path.basename(pdf_path)
-        rcp_lines = [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
-        notice_lines = [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
-        output_dir = output_dir or "."  # prototyping: default to local cwd
-        if res["images"]:
-            logger.info(f"{len(res['images'])} image(s) referenced (not uploaded in --pdf mode)")
-        logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
-        _write_parsed(rcp_lines, "R", timestamp, output_dir)
-        _write_parsed(notice_lines, "N", timestamp, output_dir)
+        rcp_doc = match_presentation(denomination, res["rcp"])
+        notice_doc = match_presentation(denomination, res["notice"])
+        if rcp_doc is None and notice_doc is None:
+            raise ValueError(f"No RCP or Notice presentation matched CIS {cis}")
+        rcp_records = [record(rcp_doc, filename, cis)] if rcp_doc else []
+        notice_records = [record(notice_doc, filename, cis)] if notice_doc else []
+        rcp_imported, rcp_errors = (
+            import_semantic_documents(rcp_records, "rcp", config.postgres) if rcp_records else (0, 0)
+        )
+        notice_imported, notice_errors = (
+            import_semantic_documents(notice_records, "notices", config.postgres) if notice_records else (0, 0)
+        )
+        if rcp_errors or notice_errors:
+            raise RuntimeError(f"Database import failed for {rcp_errors + notice_errors} document(s)")
+        logger.info(
+            "Imported %d RCP + %d Notice document(s) for CIS %s; uploaded %d new image(s)",
+            rcp_imported,
+            notice_imported,
+            cis,
+            uploaded,
+        )
         return
 
     from .centralise.acquire import get_ema_pdf, pdf_cache_key
-    from .db import get_centralised_worklist
 
-    s3_client = make_s3_client()
     worklist = get_centralised_worklist(cis=cis)
     urls = list(worklist)
     if limite is not None:
@@ -894,51 +906,74 @@ def run_centralise_parse(
     if already_done:
         logger.info(f"{len(already_done)} PDF(s) already processed (from {processed_file}); skipping those")
 
-    rcp_lines: list[dict] = []
-    notice_lines: list[dict] = []
-    pending_slugs: list[str] = []  # slugs buffered but not yet flushed to durable storage
+    rcp_records: list[dict] = []
+    notice_records: list[dict] = []
+    pending_slugs: list[str] = []
     batch_num = 0
-    total_rcp = total_notice = total_images = 0
+    total_rcp = total_notice = total_images = total_db_errors = 0
 
     def flush() -> None:
-        nonlocal batch_num, total_rcp, total_notice, rcp_lines, notice_lines, pending_slugs
-        if not rcp_lines and not notice_lines:
+        nonlocal batch_num, total_rcp, total_notice, total_db_errors
+        nonlocal rcp_records, notice_records, pending_slugs
+        if not rcp_records and not notice_records:
             return
         batch_num += 1
-        _write_parsed(rcp_lines, "R", timestamp, output_dir, batch_num=batch_num)
-        _write_parsed(notice_lines, "N", timestamp, output_dir, batch_num=batch_num)
-        _append_processed_slugs(processed_file, pending_slugs)  # only after the batch is written
-        total_rcp += len(rcp_lines)
-        total_notice += len(notice_lines)
-        rcp_lines, notice_lines, pending_slugs = [], [], []
+        rcp_imported, rcp_errors = (
+            import_semantic_documents(rcp_records, "rcp", config.postgres) if rcp_records else (0, 0)
+        )
+        notice_imported, notice_errors = (
+            import_semantic_documents(notice_records, "notices", config.postgres) if notice_records else (0, 0)
+        )
+        batch_errors = rcp_errors + notice_errors
+        total_rcp += rcp_imported
+        total_notice += notice_imported
+        total_db_errors += batch_errors
+        if batch_errors:
+            logger.error(
+                "Batch %d had %d database error(s); its PDF slugs were not marked processed",
+                batch_num,
+                batch_errors,
+            )
+        else:
+            _append_processed_slugs(processed_file, pending_slugs)
+        rcp_records, notice_records, pending_slugs = [], [], []
 
     todo = [u for u in urls if pdf_cache_key(u).split("/")[-1] not in already_done]
     logger.info(f"{len(todo)} distinct PDF(s) to parse ({len(urls) - len(todo)} skipped)")
 
-    for url in tqdm(todo, desc="PDFs", unit="pdf"):
-        try:
-            res = parse_pdf(get_ema_pdf(url, s3_client))
-            total_images += _upload_images(s3_client, res["images"])  # before records reference them
-            filename = pdf_cache_key(url).split("/")[-1]
-            for cis_code, denom in worklist[url]:
-                rcp_doc = match_presentation(denom, res["rcp"])
-                notice_doc = match_presentation(denom, res["notice"])
-                title = denom or (rcp_doc or notice_doc or {}).get("denomination", "")
-                if rcp_doc:
-                    rcp_lines.append(record(rcp_doc, filename, cis_code, title))
-                if notice_doc:
-                    notice_lines.append(record(notice_doc, filename, cis_code, title))
-            pending_slugs.append(filename)
-            if len(rcp_lines) >= batch_size or len(notice_lines) >= batch_size:
-                flush()  # flush at a PDF boundary so a slug is only recorded once its records are durable
-        except Exception as e:
-            logger.error(f"Failed to parse {url}: {e}")
+    with tqdm(todo, desc="PDFs", unit="pdf") as pbar:
+        for url in pbar:
+            try:
+                res = parse_pdf(
+                    get_ema_pdf(
+                        url,
+                        s3_client,
+                        on_cache_hit=lambda key: pbar.set_postfix_str(f"cache: {key.rsplit('/', 1)[-1]}"),
+                    ),
+                    glossary_terms=glossary_terms,
+                )
+                total_images += _upload_images(s3_client, res["images"])  # before records reference them
+                filename = pdf_cache_key(url).split("/")[-1]
+                for cis_code, denom in worklist[url]:
+                    rcp_doc = match_presentation(denom, res["rcp"])
+                    notice_doc = match_presentation(denom, res["notice"])
+                    if rcp_doc:
+                        rcp_records.append(record(rcp_doc, filename, cis_code))
+                    if notice_doc:
+                        notice_records.append(record(notice_doc, filename, cis_code))
+                pending_slugs.append(filename)
+                if len(rcp_records) >= batch_size or len(notice_records) >= batch_size:
+                    flush()
+            except Exception as e:
+                logger.error(f"Failed to parse {url}: {e}")
 
     flush()  # final partial batch
     logger.info(
-        f"Parsed {total_rcp} RCP + {total_notice} Notice record(s) in {batch_num} batch(es); "
-        f"uploaded {total_images} new image(s)"
+        f"Imported {total_rcp} RCP + {total_notice} Notice document(s) in {batch_num} batch(es); "
+        f"uploaded {total_images} new image(s); {total_db_errors} database error(s)"
     )
+    if total_db_errors:
+        raise RuntimeError(f"Centralised import completed with {total_db_errors} database error(s)")
 
 
 def run_index_sections(
@@ -1133,22 +1168,19 @@ Environment variables for database:
     )
     centralise_fetch_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to fetch")
 
-    # centralise parse — parse PDFs into RCP + Notice JSONL (one line per CIS)
+    # centralise parse — parse PDFs and import semantic RCP + Notice HTML
     centralise_parse_parser = centralise_subparsers.add_parser(
-        "parse", help="Parse EMA PDFs into RCP + Notice JSONL, one line per CIS"
+        "parse", help="Parse EMA PDFs and import semantic RCP + Notice HTML directly into PostgreSQL"
     )
     centralise_parse_parser.add_argument("--cis", help="Parse only the PDF for this CIS code")
-    centralise_parse_parser.add_argument("--pdf", help="Parse a single local PDF file (requires --cis); writes locally")
-    centralise_parse_parser.add_argument(
-        "--output-dir", "-o", help="Write parsed_R/N_*.jsonl locally to this dir (default: S3)"
-    )
+    centralise_parse_parser.add_argument("--pdf", help="Import a single local PDF file (requires --cis)")
     centralise_parse_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to parse")
     centralise_parse_parser.add_argument(
-        "--batch-size", type=int, default=500, help="Records per output JSONL batch file (default: 500)"
+        "--batch-size", type=int, default=500, help="Matched documents per database import batch (default: 500)"
     )
     centralise_parse_parser.add_argument(
         "--processed-file",
-        help="Text file of already-parsed PDF slugs; parsed PDFs are appended here and skipped on re-run",
+        help="Text file of imported PDF slugs; successful PDFs are appended and skipped on re-run",
     )
 
     # Index into OpenSearch (subcommand group)
@@ -1356,7 +1388,6 @@ Environment variables for database:
                 run_centralise_parse(
                     cis=args.cis,
                     pdf_path=args.pdf,
-                    output_dir=args.output_dir,
                     limite=args.limite,
                     batch_size=args.batch_size,
                     processed_file=args.processed_file,

@@ -128,9 +128,10 @@ poetry run infomedicament-dataeng s3 --pattern N --staging
 
 Centrally-authorised medicines (approved via the EMA, not the ANSM) have no ANSM Notice/RCP HTML.
 Instead their product information is published as a single EMA PDF (the EU QRD template).
-This pipeline parses those PDFs into the **same block-tree JSONL shape** the HTML parser produces,
-so the downstream `db-import` and `index-opensearch` steps are unchanged — a centralised CIS lands
-in the `rcp`/`notices` tables exactly like an ANSM one.
+This pipeline parses those PDFs into the same **sanitized semantic HTML** used for ANSM HTML files.
+Each imported document contains `content_html`, an ISO `date_notif` when the PDF supplies a complete
+date, and the plain-text `indication`. The semantic HTML includes deterministic `data-block-id`
+attributes, section IDs, safe tables and images, and glossary annotations.
 
 Two things make these PDFs different:
 
@@ -159,7 +160,7 @@ Options:
 The first full run is the expensive one (one HTTP round-trip per distinct PDF, ~2 MB each);
 subsequent runs only do a cheap existence check and skip anything already cached.
 
-#### 2. Parse — PDFs to Notice/RCP JSONL
+#### 2. Parse and import semantic Notice/RCP HTML
 
 ```bash
 poetry run infomedicament-dataeng centralise parse [options]
@@ -167,35 +168,31 @@ poetry run infomedicament-dataeng centralise parse [options]
 
 Options:
 - `--cis`: Parse only the PDF for this CIS code
-- `--pdf PATH`: Parse a single **local** PDF file (requires `--cis`); emits every presentation for
-  inspection and writes locally — for prototyping
-- `--output-dir, -o`: Write `parsed_R_*.jsonl` / `parsed_N_*.jsonl` locally to this dir (default: S3)
+- `--pdf PATH`: Parse and import a single **local** PDF file (requires `--cis`); the matching
+  presentation is selected using that CIS's denomination
 - `--limite`: Limit number of distinct PDFs to parse
+- `--batch-size`: Number of matched documents per database import batch (default: 500)
+- `--processed-file`: Optional text file used to resume long runs; a PDF slug is recorded only after
+  its database batch succeeds
 
 Worklist mode (no `--pdf`) fetches each distinct PDF via the S3 cache, parses all its presentations
-once, matches each CIS to its own presentation, and writes one JSONL line per CIS to
-`S3_OUTPUT_PREFIX` — the same prefix and `parsed_R/N_*.jsonl` naming the HTML parser uses.
+once, matches each CIS to its own presentation, loads the glossary terms marked for annotation, and
+upserts each matched document directly into PostgreSQL. RCPs update `rcp.content_html` and
+`rcp.dateNotif`; notices update `notices.content_html`, `notices.dateNotif`, and
+`specialites_metadata.description` with the extracted indication. Referenced images are uploaded
+before the database rows that use them.
 
 #### Full pipeline (all centralised medicines)
 
-Drop `--cis` to process every centrally-authorised CIS. Steps 3–4 are the *same* commands used for
-ANSM content; `--since` scopes them to the JSONL that today's parse just produced.
+Drop `--cis` to process every centrally-authorised CIS. The parse command performs the database
+imports itself; no JSONL generation or separate `db-import` step is required.
 
 ```bash
 # 1. Acquire every EMA PDF into the S3 cache
 poetry run infomedicament-dataeng centralise fetch
 
-# 2. Parse all cached PDFs -> parsed_R/N_*.jsonl on S3 (one line per CIS)
+# 2. Parse all cached PDFs and import semantic HTML directly into PostgreSQL
 poetry run infomedicament-dataeng centralise parse
-
-# 3. Import into PostgreSQL
-poetry run infomedicament-dataeng db-import --pattern R --since $(date +%Y-%m-%d)
-poetry run infomedicament-dataeng db-import --pattern N --since $(date +%Y-%m-%d)
-
-# 4. Index into OpenSearch
-poetry run infomedicament-dataeng index-opensearch sections --doc-type rcp    --s3 --since $(date +%Y-%m-%d)
-poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --s3 --since $(date +%Y-%m-%d)
-poetry run infomedicament-dataeng index-opensearch notice-chunks --s3 --save-embeddings --load-embeddings --since $(date +%Y-%m-%d)
 ```
 
 To prototype the whole flow end-to-end on a single drug, thread `--cis <code>` through steps 1–2
@@ -226,7 +223,9 @@ poetry run infomedicament-dataeng db-import --pattern N --since 2026-03-18
 poetry run infomedicament-dataeng db-import --pattern N --limite 10
 ```
 
-The command lists `parsed_<pattern>_*.jsonl` files under `S3_OUTPUT_PREFIX`, downloads each one, and upserts the records into PostgreSQL (by `codeCIS`). Existing content trees are deleted before re-inserting.
+The command lists `parsed_<pattern>_*.jsonl` files under `S3_OUTPUT_PREFIX`, downloads each one, and
+upserts the records into PostgreSQL (by `codeCIS`). Semantic records update `content_html` directly;
+historical records still replace their existing content trees.
 
 ### OpenSearch Indexing
 

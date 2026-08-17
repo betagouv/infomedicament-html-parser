@@ -96,6 +96,49 @@ def parse_semantic_document(
     indication_blocks = _find_indication_blocks(root)
     indication = _extract_indication(indication_blocks)
     _convert_semantics(root, indication_blocks)
+    return _finalize_semantic_root(
+        root,
+        date_notif=date_notif,
+        indication=indication,
+        image_base_url=image_base_url,
+        glossary_terms=glossary_terms,
+    )
+
+
+def finalize_semantic_html(
+    source: str,
+    *,
+    image_base_url: str = DEFAULT_IMAGE_BASE_URL,
+    glossary_terms: Iterable[str] = (),
+) -> SemanticDocument:
+    """Sanitize and annotate HTML that already uses semantic elements.
+
+    Unlike :func:`parse_semantic_document`, this entry point does not translate
+    legacy ANSM classes. It is intended for parsers, such as the centralised PDF
+    parser, that construct headings, paragraphs, lists, and emphasis directly.
+    """
+    soup = BeautifulSoup(source, "lxml")
+    root = soup.body or soup
+    indication_blocks = _find_indication_blocks(root)
+    indication = _extract_indication(indication_blocks)
+    return _finalize_semantic_root(
+        root,
+        date_notif=None,
+        indication=indication,
+        image_base_url=image_base_url,
+        glossary_terms=glossary_terms,
+    )
+
+
+def _finalize_semantic_root(
+    root: Tag,
+    *,
+    date_notif: date | None,
+    indication: str | None,
+    image_base_url: str,
+    glossary_terms: Iterable[str],
+) -> SemanticDocument:
+    """Apply the normalization shared by legacy and already-semantic inputs."""
     _sanitize(root, image_base_url=image_base_url, preserve_block_ids=False)
     _annotate_glossary_terms(root, glossary_terms)
     _remove_empty_blocks(root)
@@ -191,6 +234,10 @@ def _extract_date(root: Tag) -> date | None:
 
 
 def _find_indication_blocks(root: Tag) -> list[Tag]:
+    semantic_indication = root.find_all(attrs={"data-document-role": "indication"})
+    if semantic_indication:
+        return semantic_indication
+
     direct_indication = root.find(
         lambda tag: any(re.fullmatch(r"(?:amm)?ann3bquestceque\d*", name) for name in _normalized_classes(tag))
     )
