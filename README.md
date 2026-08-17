@@ -14,8 +14,10 @@ Data engineering tools for ANSM's [infomedicament](https://infomedicament.beta.g
 
 ## Installation
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then create the project environment:
+
 ```bash
-poetry install
+uv sync
 ```
 
 ## Commands
@@ -29,7 +31,7 @@ The CLI supports two modes: **local** (for development) and **s3** (for producti
 Process HTML files from a local directory:
 
 ```bash
-poetry run infomedicament-dataeng local <html_folder> [options]
+uv run infomedicament-dataeng local <html_folder> [options]
 ```
 
 Arguments:
@@ -45,10 +47,10 @@ Options:
 Example:
 ```bash
 # Uses database for CIS list (Specialite.isBdm)
-poetry run infomedicament-dataeng local ./html_files -o output.jsonl --pattern N
+uv run infomedicament-dataeng local ./html_files -o output.jsonl --pattern N
 
 # With CIS file override
-poetry run infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
+uv run infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
 ```
 
 #### Local Semantic Document Mode
@@ -56,7 +58,7 @@ poetry run infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o 
 Convert local `N*.htm` notices and `R*.htm` RCPs to sanitized, render-ready semantic HTML without database access:
 
 ```bash
-poetry run infomedicament-dataeng semantic-local ./html_files \
+uv run infomedicament-dataeng semantic-local ./html_files \
   --output semantic_output.jsonl \
   --limit 10
 ```
@@ -77,10 +79,10 @@ Parse Notice or RCP HTML from S3 with the semantic parser and write the result
 directly to PostgreSQL:
 
 ```bash
-poetry run infomedicament-dataeng semantic-s3-import --pattern N --staging --limit 10
-poetry run infomedicament-dataeng semantic-s3-import --pattern R --staging --limit 10
-poetry run infomedicament-dataeng semantic-s3-import --pattern N --cis 61234567
-poetry run infomedicament-dataeng semantic-s3-import --pattern R --cis 61234567
+uv run infomedicament-dataeng semantic-s3-import --pattern N --staging --limit 10
+uv run infomedicament-dataeng semantic-s3-import --pattern R --staging --limit 10
+uv run infomedicament-dataeng semantic-s3-import --pattern N --cis 61234567
+uv run infomedicament-dataeng semantic-s3-import --pattern R --cis 61234567
 ```
 
 `N` writes `notices.content_html`; `R` writes `rcp.content_html`. Omit
@@ -101,7 +103,7 @@ can attach an interactive definition UI.
 Process HTML files from S3 (Clever Cloud Cellar) and write results back to S3:
 
 ```bash
-poetry run infomedicament-dataeng s3 [options]
+uv run infomedicament-dataeng s3 [options]
 ```
 
 Options:
@@ -114,10 +116,10 @@ Options:
 Example:
 ```bash
 # Full reprocessing of all files
-poetry run infomedicament-dataeng s3 --pattern R --limite 100
+uv run infomedicament-dataeng s3 --pattern R --limite 100
 
 # Delta: parse only newly uploaded files from staging
-poetry run infomedicament-dataeng s3 --pattern N --staging
+uv run infomedicament-dataeng s3 --pattern N --staging
 ```
 
 #### Global Options
@@ -149,7 +151,7 @@ The worklist comes from the PDBM database (`VUEmaEpar` LEFT JOIN `Specialite`).
 #### 1. Fetch — cache PDFs on S3
 
 ```bash
-poetry run infomedicament-dataeng centralise fetch [options]
+uv run infomedicament-dataeng centralise fetch [options]
 ```
 
 Options:
@@ -163,7 +165,7 @@ subsequent runs only do a cheap existence check and skip anything already cached
 #### 2. Parse and import semantic Notice/RCP HTML
 
 ```bash
-poetry run infomedicament-dataeng centralise parse [options]
+uv run infomedicament-dataeng centralise parse [options]
 ```
 
 Options:
@@ -189,10 +191,10 @@ imports itself; no JSONL generation or separate `db-import` step is required.
 
 ```bash
 # 1. Acquire every EMA PDF into the S3 cache
-poetry run infomedicament-dataeng centralise fetch
+uv run infomedicament-dataeng centralise fetch
 
 # 2. Parse all cached PDFs and import semantic HTML directly into PostgreSQL
-poetry run infomedicament-dataeng centralise parse
+uv run infomedicament-dataeng centralise parse
 ```
 
 To prototype the whole flow end-to-end on a single drug, thread `--cis <code>` through steps 1–2
@@ -203,7 +205,7 @@ and use `--limite` on the import/index steps.
 Import parsed JSONL files from S3 into PostgreSQL. This replaces the legacy TypeScript `importNoticeRCP.ts` script.
 
 ```bash
-poetry run infomedicament-dataeng db-import --pattern <N|R> [options]
+uv run infomedicament-dataeng db-import --pattern <N|R> [options]
 ```
 
 Options:
@@ -214,13 +216,13 @@ Options:
 Example:
 ```bash
 # Import all RCP records
-poetry run infomedicament-dataeng db-import --pattern R
+uv run infomedicament-dataeng db-import --pattern R
 
 # Import only JSONL files produced on or after a given date
-poetry run infomedicament-dataeng db-import --pattern N --since 2026-03-18
+uv run infomedicament-dataeng db-import --pattern N --since 2026-03-18
 
 # Test with 10 records
-poetry run infomedicament-dataeng db-import --pattern N --limite 10
+uv run infomedicament-dataeng db-import --pattern N --limite 10
 ```
 
 The command lists `parsed_<pattern>_*.jsonl` files under `S3_OUTPUT_PREFIX`, downloads each one, and
@@ -239,7 +241,7 @@ Both use a French analyzer (elision, stopwords, stemming).
 #### Specialités index
 
 ```bash
-poetry run infomedicament-dataeng index-opensearch specialites [options]
+uv run infomedicament-dataeng index-opensearch specialites [options]
 ```
 
 Options:
@@ -249,10 +251,10 @@ Options:
 Examples:
 ```bash
 # Full index from PostgreSQL
-poetry run infomedicament-dataeng index-opensearch specialites
+uv run infomedicament-dataeng index-opensearch specialites
 
 # Test with 100 documents
-poetry run infomedicament-dataeng index-opensearch specialites --limite 100
+uv run infomedicament-dataeng index-opensearch specialites --limite 100
 ```
 
 Re-indexing is idempotent — `_id` is the CIS code, so re-running overwrites existing documents.
@@ -262,7 +264,7 @@ Re-indexing is idempotent — `_id` is the CIS code, so re-running overwrites ex
 Index parsed Notice/RCP sections into OpenSearch. Each section of a notice or RCP becomes one document (~40 sections × ~15k medications ≈ 600k documents).
 
 ```bash
-poetry run infomedicament-dataeng index-opensearch sections --doc-type <notice|rcp> [options]
+uv run infomedicament-dataeng index-opensearch sections --doc-type <notice|rcp> [options]
 ```
 
 Options:
@@ -276,17 +278,17 @@ Options:
 Examples:
 ```bash
 # Index a local JSONL file (development)
-poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --input output.jsonl
+uv run infomedicament-dataeng index-opensearch sections --doc-type notice --input output.jsonl
 
 # Index with a record limit for testing
-poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --input output.jsonl --limite 100
+uv run infomedicament-dataeng index-opensearch sections --doc-type notice --input output.jsonl --limite 100
 
 # Index from S3 (production)
-poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --s3
-poetry run infomedicament-dataeng index-opensearch sections --doc-type rcp --s3
+uv run infomedicament-dataeng index-opensearch sections --doc-type notice --s3
+uv run infomedicament-dataeng index-opensearch sections --doc-type rcp --s3
 
 # Delta: only index JSONL files produced since a given date
-poetry run infomedicament-dataeng index-opensearch sections --doc-type notice --s3 --since 2026-03-01
+uv run infomedicament-dataeng index-opensearch sections --doc-type notice --s3 --since 2026-03-01
 ```
 
 Re-indexing is idempotent — each document has a deterministic ID (`{cis}_{anchor}_{doc_type}`), so re-running overwrites existing documents without creating duplicates.
@@ -298,7 +300,7 @@ Index notice content as fine-grained chunks with vector embeddings for semantic 
 Requires `ALBERT_API_KEY` — see [Configuration](#configuration).
 
 ```bash
-poetry run infomedicament-dataeng index-opensearch notice-chunks (--input PATH | --s3) [options]
+uv run infomedicament-dataeng index-opensearch notice-chunks (--input PATH | --s3) [options]
 ```
 
 Options:
@@ -314,15 +316,15 @@ Options:
 Examples:
 ```bash
 # Development: index a local file
-poetry run infomedicament-dataeng index-opensearch notice-chunks \
+uv run infomedicament-dataeng index-opensearch notice-chunks \
   --input parsed_notices.jsonl --chunk-batch-size 64
 
 # Production: embed from S3, cache results, then load from cache on subsequent runs
-poetry run infomedicament-dataeng index-opensearch notice-chunks \
+uv run infomedicament-dataeng index-opensearch notice-chunks \
   --s3 --save-embeddings --load-embeddings --chunk-batch-size 64
 
 # Delta: only newly parsed notices
-poetry run infomedicament-dataeng index-opensearch notice-chunks \
+uv run infomedicament-dataeng index-opensearch notice-chunks \
   --s3 --save-embeddings --load-embeddings --since 2026-04-01 --chunk-batch-size 64
 ```
 
@@ -333,7 +335,7 @@ The embedding cache is stored on S3 at `exports/parsed/embeddings/notices/{cis}.
 Convert SQL INSERT statements (T-SQL, MySQL, PostgreSQL) to CSV files.
 
 ```bash
-poetry run infomedicament-dataeng sql-to-csv <sql_file> [options]
+uv run infomedicament-dataeng sql-to-csv <sql_file> [options]
 ```
 
 Options:
@@ -344,10 +346,10 @@ Options:
 Example with Codex Triam ATC files:
 ```bash
 # Convert ClasseATC
-poetry run infomedicament-dataeng sql-to-csv ClasseATC_data.sql -o classe_atc.csv
+uv run infomedicament-dataeng sql-to-csv ClasseATC_data.sql -o classe_atc.csv
 
 # Convert VUClassesATC (CIS <-> ATC links)
-poetry run infomedicament-dataeng sql-to-csv VUClassesATC_data.sql -o cis_atc.csv
+uv run infomedicament-dataeng sql-to-csv VUClassesATC_data.sql -o cis_atc.csv
 ```
 
 #### Importing ATC data into PostgreSQL
@@ -373,7 +375,7 @@ Classify medications for pediatric use based on their parsed RCP content (sectio
 - **C**: Sur avis d'un professionnel de santé (requires professional advice)
 
 ```bash
-poetry run infomedicament-dataeng classify-pediatric (--local-rcp <path> | --s3) [options]
+uv run infomedicament-dataeng classify-pediatric (--local-rcp <path> | --s3) [options]
 ```
 
 Options:
@@ -387,16 +389,16 @@ Options:
 Examples:
 ```bash
 # From a local file (development / evaluation)
-poetry run infomedicament-dataeng classify-pediatric \
+uv run infomedicament-dataeng classify-pediatric \
   --local-rcp data/rcp_pediatrie.jsonl \
   --truth data/ground_truth.csv \
   -o data/predictions.csv
 
 # From S3 (no prior download needed)
-poetry run infomedicament-dataeng classify-pediatric --s3 -o data/predictions.csv
+uv run infomedicament-dataeng classify-pediatric --s3 -o data/predictions.csv
 
 # From S3, only files produced since a given date
-poetry run infomedicament-dataeng classify-pediatric --s3 --since 2026-01-01 -o data/predictions.csv
+uv run infomedicament-dataeng classify-pediatric --s3 --since 2026-01-01 -o data/predictions.csv
 ```
 
 The predictions CSV includes explainability columns (matched keywords, evidence text, C-reasons) for manual review.
@@ -406,7 +408,7 @@ The predictions CSV includes explainability columns (matched keywords, evidence 
 Fetch datasets from the French open-data platform and load them into PostgreSQL. Each run truncates the target table and re-inserts all rows.
 
 ```bash
-poetry run infomedicament-dataeng import-datagouv --config <yaml_file> [--dataset <name>]
+uv run infomedicament-dataeng import-datagouv --config <yaml_file> [--dataset <name>]
 ```
 
 Options:
@@ -416,10 +418,10 @@ Options:
 Example:
 ```bash
 # Import all datasets defined in data_sources/has.yml (asmr and smr)
-poetry run infomedicament-dataeng import-datagouv --config data_sources/has.yml
+uv run infomedicament-dataeng import-datagouv --config data_sources/has.yml
 
 # Import only the smr table
-poetry run infomedicament-dataeng import-datagouv --config data_sources/has.yml --dataset smr
+uv run infomedicament-dataeng import-datagouv --config data_sources/has.yml --dataset smr
 ```
 
 #### Adding a new dataset
@@ -455,15 +457,15 @@ When only a small number of new or updated HTML files arrive, avoid reprocessing
 
 2. **Parse only the staged files:**
    ```bash
-   poetry run infomedicament-dataeng s3 --pattern N --staging
-   poetry run infomedicament-dataeng s3 --pattern R --staging
+   uv run infomedicament-dataeng s3 --pattern N --staging
+   uv run infomedicament-dataeng s3 --pattern R --staging
    ```
    Files are automatically moved from staging to the main prefix after each batch.
 
 3. **Import only the new JSONL output:**
    ```bash
-   poetry run infomedicament-dataeng db-import --pattern N --since YYYY-MM-DD
-   poetry run infomedicament-dataeng db-import --pattern R --since YYYY-MM-DD
+   uv run infomedicament-dataeng db-import --pattern N --since YYYY-MM-DD
+   uv run infomedicament-dataeng db-import --pattern R --since YYYY-MM-DD
    ```
 
 ## Configuration
@@ -584,20 +586,20 @@ Set these in your Scalingo app settings:
 
 ```bash
 # Install with dev dependencies
-poetry install --with dev
+uv sync
 
 # Run tests
-poetry run pytest
+uv run pytest
 
 # Run tests with coverage
-poetry run pytest --cov=infomedicament_dataeng
+uv run pytest --cov=infomedicament_dataeng
 
 # Lint and format
-poetry run ruff check .
-poetry run ruff format .
+uv run ruff check .
+uv run ruff format .
 
 # Auto-fix linting issues
-poetry run ruff check . --fix
+uv run ruff check . --fix
 ```
 
 ### Pre-commit hooks
@@ -610,5 +612,5 @@ This repo uses [pre-commit](https://pre-commit.com/) to enforce code quality:
 After installing dependencies, register the hooks once:
 
 ```bash
-poetry run pre-commit install --hook-type pre-commit --hook-type pre-push
+uv run pre-commit install --hook-type pre-commit --hook-type pre-push
 ```

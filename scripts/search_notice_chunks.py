@@ -1,7 +1,7 @@
 """Run a k-NN search against the notice_chunks index using the Albert API.
 
 Usage:
-    ALBERT_API_KEY=... poetry run python scripts/search_notice_chunks.py "puis-je boire de l'alcool ?"
+    ALBERT_API_KEY=... uv run python scripts/search_notice_chunks.py "puis-je boire de l'alcool ?"
 """
 
 import sys

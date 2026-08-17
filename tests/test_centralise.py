@@ -142,7 +142,7 @@ class TestParseFanOut:
         monkeypatch.setattr(
             cli,
             "import_semantic_documents",
-            lambda records, table, config: (imports.append((table, list(records))) or (len(records), 0)),
+            lambda records, table, config: imports.append((table, list(records))) or (len(records), 0),
         )
 
         cli.run_centralise_parse()

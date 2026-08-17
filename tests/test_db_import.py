@@ -206,12 +206,12 @@ def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
     monkeypatch.setattr(
         cli,
         "import_semantic_documents",
-        lambda records, table, config: (semantic_calls.append((list(records), table)) or (1, 0)),
+        lambda records, table, config: semantic_calls.append((list(records), table)) or (1, 0),
     )
     monkeypatch.setattr(
         cli,
         "import_to_postgres",
-        lambda records, main_table, content_table, config: (legacy_calls.append(list(records)) or (0, 0)),
+        lambda records, main_table, content_table, config: legacy_calls.append(list(records)) or (0, 0),
     )
 
     cli.db_import("N")
