@@ -53,8 +53,7 @@ class TestGetEmaPdf:
         assert s3.uploads == {}
 
     def test_cache_hit_uses_status_callback_without_info_log(self, monkeypatch, caplog):
-        monkeypatch.setattr(acquire, "_fetch_from_ema",
-                            lambda url: pytest.fail("unexpected EMA fetch"))
+        monkeypatch.setattr(acquire, "_fetch_from_ema", lambda url: pytest.fail("unexpected EMA fetch"))
         s3 = FakeS3Client(exists=True, stored=b"%PDF-cached")
         statuses = []
 
@@ -65,8 +64,7 @@ class TestGetEmaPdf:
         assert "Cache hit:" not in caplog.text
 
     def test_cache_miss_fetches_and_uploads_with_sidecar(self, monkeypatch):
-        monkeypatch.setattr(acquire, "_fetch_from_ema",
-                            lambda url: b"%PDF-fresh")
+        monkeypatch.setattr(acquire, "_fetch_from_ema", lambda url: b"%PDF-fresh")
         s3 = FakeS3Client(exists=False)
 
         assert get_ema_pdf(URL, s3) == b"%PDF-fresh"
@@ -74,8 +72,7 @@ class TestGetEmaPdf:
         assert s3.uploads[EXPECTED_KEY] == b"%PDF-fresh"
 
     def test_refresh_bypasses_cache(self, monkeypatch):
-        monkeypatch.setattr(acquire, "_fetch_from_ema",
-                            lambda url: b"%PDF-new")
+        monkeypatch.setattr(acquire, "_fetch_from_ema", lambda url: b"%PDF-new")
         s3 = FakeS3Client(exists=True, stored=b"%PDF-old")
 
         assert get_ema_pdf(URL, s3, refresh=True) == b"%PDF-new"
@@ -137,18 +134,15 @@ class TestParseFanOut:
 
         monkeypatch.setattr(cli, "tqdm", FakeTqdm)
         monkeypatch.setattr(cli, "make_s3_client", lambda: object())
-        monkeypatch.setattr(cli, "get_glossary_terms",
-                            lambda config: ["solution"])
+        monkeypatch.setattr(cli, "get_glossary_terms", lambda config: ["solution"])
         monkeypatch.setattr(acq, "get_ema_pdf", get_cached_pdf)
-        monkeypatch.setattr(db, "get_centralised_worklist",
-                            lambda cis=None: worklist)
+        monkeypatch.setattr(db, "get_centralised_worklist", lambda cis=None: worklist)
         monkeypatch.setattr(parser, "parse_pdf", lambda b, **kwargs: parsed)
         imports = []
         monkeypatch.setattr(
             cli,
             "import_semantic_documents",
-            lambda records, table, config: (imports.append(
-                (table, list(records))) or (len(records), 0)),
+            lambda records, table, config: (imports.append((table, list(records))) or (len(records), 0)),
         )
 
         cli.run_centralise_parse()
@@ -164,5 +158,4 @@ class TestParseFanOut:
         assert by_cis["111"]["cis"] == "111"
         assert by_cis["111"]["indication"] == "indication-rcp-cartouche"
         assert {record["cis"] for record in notice_records} == {"111", "222"}
-        assert postfixes == [
-            "cache: abasaglar-epar-product-information_fr.pdf"]
+        assert postfixes == ["cache: abasaglar-epar-product-information_fr.pdf"]

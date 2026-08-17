@@ -107,8 +107,7 @@ class TestInsertContentBlocks:
             conn,
             "notices_content",
             [
-                {"type": "table", "html": dirty_html,
-                    "children": [{"content": "cell"}]},
+                {"type": "table", "html": dirty_html, "children": [{"content": "cell"}]},
             ],
         )
         params = conn.execute_calls[-1]
@@ -120,8 +119,7 @@ class TestInsertContentBlocks:
             conn,
             "notices_content",
             [
-                {"type": "table", "html": "<table/>",
-                    "children": [{"content": "cell"}]},
+                {"type": "table", "html": "<table/>", "children": [{"content": "cell"}]},
             ],
         )
         # only the table itself is inserted, not the child cell
@@ -182,20 +180,17 @@ def test_upsert_semantic_document_rejects_unknown_table(fake_connection):
     conn = fake_connection()
 
     try:
-        _upsert_semantic_document(
-            conn, "other", {"cis": "61234567", "content_html": "<p>Document</p>"})
+        _upsert_semantic_document(conn, "other", {"cis": "61234567", "content_html": "<p>Document</p>"})
     except ValueError as error:
         assert str(error) == "Unsupported semantic document table: other"
     else:
-        raise AssertionError(
-            "Unknown semantic document table should be rejected")
+        raise AssertionError("Unknown semantic document table should be rejected")
 
 
 def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
     from infomedicament_dataeng import cli
 
-    record = {"cis": "61234567", "content_html": "<p>Notice</p>",
-              "date_notif": None, "indication": "Pain"}
+    record = {"cis": "61234567", "content_html": "<p>Notice</p>", "date_notif": None, "indication": "Pain"}
 
     class FakeS3:
         def list_parsed_files(self, pattern, since=None):
@@ -207,19 +202,16 @@ def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
     semantic_calls = []
     legacy_calls = []
     monkeypatch.setattr(cli, "make_s3_client", FakeS3)
-    monkeypatch.setattr(cli, "get_config",
-                        lambda: SimpleNamespace(postgres=object()))
+    monkeypatch.setattr(cli, "get_config", lambda: SimpleNamespace(postgres=object()))
     monkeypatch.setattr(
         cli,
         "import_semantic_documents",
-        lambda records, table, config: (
-            semantic_calls.append((list(records), table)) or (1, 0)),
+        lambda records, table, config: (semantic_calls.append((list(records), table)) or (1, 0)),
     )
     monkeypatch.setattr(
         cli,
         "import_to_postgres",
-        lambda records, main_table, content_table, config: (
-            legacy_calls.append(list(records)) or (0, 0)),
+        lambda records, main_table, content_table, config: (legacy_calls.append(list(records)) or (0, 0)),
     )
 
     cli.db_import("N")
