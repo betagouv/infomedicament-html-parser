@@ -4,7 +4,7 @@ Data engineering tools for ANSM's [infomedicament](https://infomedicament.beta.g
 
 ## Features
 
-- [HTML Parsing](#html-parsing) — parse ANSM Notice/RCP HTML files from local disk or S3
+- [HTML Parsing](#html-parsing) — parse ANSM Notice/RCP files into semantic HTML from local disk or S3
 - [Centralised EMA PDFs](#centralised-ema-pdfs) — parse centrally-authorised medicines' EMA PDFs into the same Notice/RCP shape
 - [DB Import](#db-import) — import parsed JSONL files into PostgreSQL
 - [OpenSearch Indexing](#opensearch-indexing) — index parsed sections into OpenSearch for full-text search
@@ -24,9 +24,13 @@ uv sync
 
 ### HTML Parsing
 
-The CLI supports two modes: **local** (for development) and **s3** (for production).
+The semantic HTML parser is the supported parser for new imports. Use
+`semantic-local` for local files and `semantic-s3-import` for S3 documents.
 
-#### Local Mode
+The legacy tree parser remains available through the `local` and `s3` commands
+for compatibility, but it is deprecated and should not be used for new imports.
+
+#### Legacy Local Mode (deprecated)
 
 Process HTML files from a local directory:
 
@@ -53,7 +57,7 @@ uv run infomedicament-dataeng local ./html_files -o output.jsonl --pattern N
 uv run infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
 ```
 
-#### Local Semantic Document Mode
+#### Local Semantic Document Mode (recommended)
 
 Convert local `N*.htm` notices and `R*.htm` RCPs to sanitized, render-ready semantic HTML without database access:
 
@@ -73,7 +77,7 @@ Each JSONL record contains `source.filename`, ISO `date_notif`, plain-text
 `indication`, and sanitized `content_html`. The indication block is also marked
 with `data-document-role="indication"` in the semantic HTML.
 
-#### Experimental semantic S3 import
+#### Semantic S3 Import (recommended)
 
 Parse Notice or RCP HTML from S3 with the semantic parser and write the result
 directly to PostgreSQL:
@@ -98,7 +102,7 @@ the command. Terms whose `ref_glossaire.a_souligner` value is true are wrapped
 as `<span data-definition="Canonical glossary name">…</span>` so the frontend
 can attach an interactive definition UI.
 
-#### S3 Mode
+#### Legacy S3 Mode (deprecated)
 
 Process HTML files from S3 (Clever Cloud Cellar) and write results back to S3:
 
