@@ -19,6 +19,7 @@ from .convert import sql_to_csv
 from .datagouv import import_dataset, load_datasets
 from .datapackage_importer import import_datapackage
 from .db import (
+    check_sequences,
     get_authorized_cis,
     get_filename_to_cis_mapping,
     get_glossary_terms,
@@ -676,7 +677,7 @@ def run_pediatric_classification(
         print(format_metrics(metrics))
 
 
-def db_import(pattern: str, limite: int | None = None, since: date | None = None) -> None:
+def db_import(pattern: str, limite: int | None = None, since: date | None = None, fail_fast: bool = False) -> None:
     """
     Import legacy-tree or semantic-HTML JSONL files from S3 into PostgreSQL.
 
@@ -684,6 +685,7 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
         pattern: "N" for Notices, "R" for RCP.
         limite: Limit total number of records imported (for testing).
         since: If provided, only import JSONL files dated on or after this date.
+        fail_fast: Abort on the first failing record, with its full traceback.
     """
     s3_client = make_s3_client()
     config = get_config()
@@ -696,6 +698,7 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
 
     total_imported = 0
     total_errors = 0
+    legacy_sequence_checked = False
 
     for key in tqdm(jsonl_keys, desc="Files", unit="file"):
         content = s3_client.download_file_content(key)
@@ -712,8 +715,10 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
         for line_num, line in enumerate(lines, start=1):
             try:
                 records.append(json.loads(line))
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse line {line_num} in {key}: {e}")
+                if fail_fast:
+                    raise
                 parse_errors += 1
 
         semantic_records = [record for record in records if "content_html" in record]
@@ -724,23 +729,48 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
                 tqdm(semantic_records, desc="semantic records", unit="rec", leave=False),
                 main_table,
                 config.postgres,
+                fail_fast=fail_fast,
             )
             imported += semantic_imported
             db_errors += semantic_errors
         if legacy_records:
+            if not legacy_sequence_checked:
+                for table, next_id, max_id, drifted in check_sequences([content_table], config=config.postgres):
+                    if drifted:
+                        logger.warning(
+                            f"{table}: next id {next_id} but MAX(id)={max_id} — legacy inserts will fail with"
+                            f" duplicate key errors. Run: infomedicament-dataeng db-check --fix"
+                        )
+                legacy_sequence_checked = True
             legacy_imported, legacy_errors = import_to_postgres(
                 tqdm(legacy_records, desc="records", unit="rec", leave=False),
                 main_table,
                 content_table,
                 config.postgres,
+                fail_fast=fail_fast,
             )
             imported += legacy_imported
             db_errors += legacy_errors
         total_imported += imported
         total_errors += parse_errors + db_errors
-        logger.info(f"{key}: {imported} imported, {parse_errors + db_errors} errors")
+        level = logging.WARNING if (parse_errors + db_errors) else logging.INFO
+        logger.log(level, f"{key}: {imported} imported, {parse_errors + db_errors} errors")
 
     logger.info(f"Import complete: {total_imported} records imported, {total_errors} errors")
+
+
+def db_check(fix: bool = False) -> None:
+    """Report id-sequence drift on the import target tables, optionally repairing it."""
+    tables = ["notices_content", "rcp_content"]  # main tables key on codeCIS, no id sequence
+    rows = check_sequences(tables, fix=fix, config=get_config().postgres)
+
+    print(f"{'table':<20} {'next id':>12} {'max(id)':>12}  status")
+    for table, next_id, max_id, drifted in rows:
+        status = ("FIXED" if fix else "DRIFTED — inserts will fail") if drifted else "ok"
+        print(f"{table:<20} {next_id:>12} {max_id:>12}  {status}")
+
+    if any(d for *_, d in rows) and not fix:
+        print("\nRun with --fix to reset the sequences.")
 
 
 def run_import_datagouv(config_path: Path, dataset_name: str | None = None) -> None:
@@ -1116,6 +1146,14 @@ Environment variables for database:
         metavar="YYYY-MM-DD",
         help="Only import JSONL files whose filename timestamp is on or after this date",
     )
+    db_import_parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Abort on the first invalid JSON or failed database record and show its full traceback",
+    )
+
+    db_check_parser = subparsers.add_parser("db-check", help="Diagnose the import target tables (id sequence drift)")
+    db_check_parser.add_argument("--fix", action="store_true", help="Reset any drifted sequence to MAX(id)+1")
 
     # Import from data.gouv.fr mode
     datagouv_parser = subparsers.add_parser("import-datagouv", help="Import datasets from data.gouv.fr into PostgreSQL")
@@ -1245,6 +1283,10 @@ Environment variables for database:
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    # --verbose is for our own code; these libraries log a wall of DEBUG per request.
+    if args.verbose:
+        for noisy in ("boto3", "botocore", "s3transfer", "urllib3", "opensearchpy"):
+            logging.getLogger(noisy).setLevel(logging.INFO)
 
     if args.command == "local":
         try:
@@ -1322,7 +1364,14 @@ Environment variables for database:
 
     elif args.command == "db-import":
         try:
-            db_import(args.pattern, limite=args.limite, since=args.since)
+            db_import(args.pattern, limite=args.limite, since=args.since, fail_fast=args.fail_fast)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "db-check":
+        try:
+            db_check(fix=args.fix)
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)

@@ -1,12 +1,33 @@
 """Tests for the local semantic-parser CLI workflow."""
 
 import json
+import logging
 import sys
 from types import SimpleNamespace
 
 import pytest
 
 from infomedicament_dataeng import cli
+
+
+def test_verbose_pins_opensearchpy_logger(monkeypatch):
+    configured_levels = {}
+    get_logger = logging.getLogger
+
+    def capture_logger(name=None):
+        if name is None:
+            return get_logger()
+        return SimpleNamespace(setLevel=lambda level: configured_levels.__setitem__(name, level))
+
+    monkeypatch.setattr(cli, "get_config", lambda: SimpleNamespace(log_level="INFO"))
+    monkeypatch.setattr(cli, "traiter_dossier_semantic_local", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli.logging, "getLogger", capture_logger)
+    monkeypatch.setattr(sys, "argv", ["infomedicament-dataeng", "--verbose", "semantic-local", "html-files"])
+
+    cli.main()
+
+    assert configured_levels["opensearchpy"] == logging.INFO
+    assert "opensearch" not in configured_levels
 
 
 def test_traiter_fichier_semantic_local_returns_render_ready_record(tmp_path):

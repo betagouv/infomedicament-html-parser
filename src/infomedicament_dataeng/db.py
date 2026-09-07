@@ -1,5 +1,6 @@
 """Database operations for CIS mapping."""
 
+import logging
 import os
 import re
 
@@ -7,6 +8,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, Engine
 
 from .config import DatabaseConfig, PostgresConfig, get_config
+
+logger = logging.getLogger(__name__)
 
 
 def get_postgres_engine(config: PostgresConfig | None = None) -> Engine:
@@ -122,6 +125,33 @@ def get_centralised_worklist(
     return worklist
 
 
+def check_sequences(tables: list[str], fix: bool = False, config: PostgresConfig | None = None) -> list[tuple]:
+    """Report tables whose id sequence lags MAX(id), which makes every INSERT fail.
+
+    Happens when rows arrive with explicit ids (dump restore, seed) without a
+    matching setval. Returns (table, last_value, max_id, drifted) per table.
+    """
+    engine = get_postgres_engine(config)
+    rows = []
+    with engine.connect() as conn:
+        for table in tables:
+            seq = conn.execute(text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table}).scalar()
+            if not seq:
+                logger.warning("%s: no serial sequence on id", table)
+                continue
+            last_value, is_called = conn.execute(text(f"SELECT last_value, is_called FROM {seq}")).one()
+            max_id = int(conn.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {table}")).scalar() or 0)
+            # The next id nextval() will hand out; is_called=false means last_value itself is next.
+            next_id = int(last_value) + (1 if is_called else 0)
+            drifted = next_id <= max_id
+            rows.append((table, next_id, max_id, drifted))
+            if drifted and fix:
+                conn.execute(text("SELECT setval(:s, :v, false)"), {"s": seq, "v": max_id + 1})
+                conn.commit()
+                logger.info("%s: sequence reset to %d", table, max_id + 1)
+    return rows
+
+
 def get_clean_html(html: str) -> str:
     """Remove <a name="...">...</a> tags while preserving their content."""
     return re.sub(r"<a name=[^>]*>(.*?)</a>", r"\1", html, flags=re.DOTALL)
@@ -202,7 +232,7 @@ def _import_one_record(conn, main_table: str, content_table: str, record: dict) 
     source = record.get("source", {})
     cis = source.get("cis")
     if not cis:
-        return
+        raise ValueError(f"record has no source.cis (source={source!r})")
 
     code_cis = int(cis)
     content_blocks = record.get("content") or []
@@ -287,19 +317,29 @@ def import_semantic_documents(
     records,
     table: str,
     config: PostgresConfig | None = None,
+    fail_fast: bool = False,
 ) -> tuple[int, int]:
-    """Upsert semantic HTML into PostgreSQL, committing each document independently."""
+    """Upsert semantic HTML into PostgreSQL, committing each document independently.
+
+    Args:
+        fail_fast: Re-raise on the first failing record instead of counting it.
+    """
     engine = get_postgres_engine(config)
     imported = 0
     errors = 0
     with engine.connect() as conn:
         for record in records:
+            cis = record.get("cis", "?")
             try:
                 _upsert_semantic_document(conn, table, record)
                 conn.commit()
                 imported += 1
-            except Exception:
+            except Exception as e:
                 conn.rollback()
+                if fail_fast:
+                    raise
+                logger.error("CIS %s failed: %s", cis, str(e).split("\n")[0])
+                logger.debug("CIS %s full traceback", cis, exc_info=True)
                 errors += 1
     return imported, errors
 
@@ -309,8 +349,12 @@ def import_to_postgres(
     main_table: str,
     content_table: str,
     config: PostgresConfig | None = None,
+    fail_fast: bool = False,
 ) -> tuple[int, int]:
     """Import parsed JSONL records into PostgreSQL.
+
+    Args:
+        fail_fast: Re-raise on the first failing record instead of counting it.
 
     Returns:
         Tuple of (imported_count, error_count).
@@ -320,11 +364,17 @@ def import_to_postgres(
     errors = 0
     with engine.connect() as conn:
         for record in records:
+            cis = (record.get("source") or {}).get("cis", "?")
             try:
                 _import_one_record(conn, main_table, content_table, record)
                 conn.commit()
                 imported += 1
-            except Exception:
+            except Exception as e:
                 conn.rollback()
+                if fail_fast:
+                    raise
+                # Only the root cause: the full record is megabytes of content blocks.
+                logger.error("CIS %s failed: %s", cis, str(e).split("\n")[0])
+                logger.debug("CIS %s full traceback", cis, exc_info=True)
                 errors += 1
     return imported, errors
