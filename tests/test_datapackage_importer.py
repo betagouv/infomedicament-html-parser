@@ -1,0 +1,51 @@
+"""Tests for ANSM datapackage import configuration."""
+
+from infomedicament_dataeng.datapackage_importer import LOAD_ORDER
+
+
+def test_load_order_covers_current_ansm_package_resources():
+    expected_resources = {
+        "specialite",
+        "presentation",
+        "presentation_evenement",
+        "element",
+        "recipient",
+        "atc",
+        "specialite_atc",
+        "classe_clinique",
+        "specialite_classe_clinique",
+        "pathologie",
+        "classe_clinique_pathologie",
+        "delivrance",
+        "specialite_delivrance",
+        "specialite_titulaire",
+        "specialite_evenement",
+        "caracteristique",
+        "composant",
+        "substance_nom",
+        "dispositif",
+        "groupe_substance",
+        "classe_interaction",
+        "substance_groupe_substance",
+        "classe_groupe_substance",
+        "interaction",
+        "document",
+    }
+
+    assert len(LOAD_ORDER) == len(set(LOAD_ORDER))
+    assert set(LOAD_ORDER) == expected_resources
+
+
+def test_load_order_places_new_resources_after_their_parents():
+    positions = {resource: index for index, resource in enumerate(LOAD_ORDER)}
+    dependencies = [
+        ("presentation_evenement", "presentation"),
+        ("classe_clinique_pathologie", "classe_clinique"),
+        ("classe_clinique_pathologie", "pathologie"),
+        ("specialite_delivrance", "specialite"),
+        ("specialite_delivrance", "delivrance"),
+        ("specialite_evenement", "specialite"),
+    ]
+
+    for child, parent in dependencies:
+        assert positions[parent] < positions[child]

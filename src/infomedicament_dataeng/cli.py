@@ -18,7 +18,13 @@ from .config import get_config
 from .convert import sql_to_csv
 from .datagouv import import_dataset, load_datasets
 from .datapackage_importer import import_datapackage
-from .db import get_authorized_cis, get_filename_to_cis_mapping, import_to_postgres
+from .db import (
+    get_authorized_cis,
+    get_filename_to_cis_mapping,
+    get_glossary_terms,
+    import_semantic_documents,
+    import_to_postgres,
+)
 from .io import charger_liste_cis
 from .opensearch.notice_chunks import DEFAULT_INDEX as NOTICE_CHUNKS_DEFAULT_INDEX
 from .opensearch.notice_chunks import index_from_local as index_notice_chunks_from_local
@@ -27,7 +33,7 @@ from .opensearch.sections import DEFAULT_INDEX as SECTIONS_DEFAULT_INDEX
 from .opensearch.sections import index_from_local, index_from_s3
 from .opensearch.specialites import DEFAULT_INDEX as SPECIALITES_DEFAULT_INDEX
 from .opensearch.specialites import index_specialites
-from .parsing import html_vers_json
+from .parsing import DEFAULT_IMAGE_BASE_URL, html_vers_json, parse_semantic_document
 from .s3 import make_s3_client
 
 logger = logging.getLogger(__name__)
@@ -65,6 +71,34 @@ def traiter_fichier_local(fichier_data: tuple) -> dict | None:
         data = html_vers_json(html)
 
         return {"source": {"filename": base, "cis": cis}, "content": data}
+
+    except Exception as e:
+        logger.error(f"Error processing {fichier}: {e}")
+        return None
+
+
+def traiter_fichier_semantic_local(fichier_data: tuple) -> dict | None:
+    """
+    Process a local notice or RCP HTML file into sanitized semantic HTML.
+
+    Args:
+        fichier_data: Tuple containing (file_path, image_base_url)
+
+    Returns:
+        Render-ready notice record or None if error
+    """
+    fichier, image_base_url = fichier_data
+
+    try:
+        base = os.path.basename(fichier)
+        document = parse_semantic_document(Path(fichier).read_bytes(), image_base_url=image_base_url)
+
+        return {
+            "source": {"filename": base},
+            "date_notif": document.date_notif.isoformat() if document.date_notif else None,
+            "indication": document.indication,
+            "content_html": document.content_html,
+        }
 
     except Exception as e:
         logger.error(f"Error processing {fichier}: {e}")
@@ -174,6 +208,139 @@ def traiter_dossier_local(
 
     logger.info(f"Processing complete: {files_processed} processed, {files_skipped} skipped")
     logger.info(f"Output: {fichier_sortie}")
+
+
+def traiter_dossier_semantic_local(
+    dossier_html: str,
+    fichier_sortie: str = "semantic_output.jsonl",
+    limite: int | None = None,
+    pattern: str = "all",
+    image_base_url: str = DEFAULT_IMAGE_BASE_URL,
+) -> None:
+    """
+    Process a local folder of notices and/or RCPs into semantic HTML JSONL.
+
+    Args:
+        dossier_html: Path to the folder containing HTML files
+        fichier_sortie: Output JSONL file
+        limite: Limit number of files to process
+        pattern: Document filename prefix: "N", "R", or "all"
+        image_base_url: Base URL used to rewrite relative image paths
+    """
+    if pattern not in {"N", "R", "all"}:
+        raise ValueError('pattern must be "N", "R", or "all"')
+    filename_pattern = "[NR]*.htm" if pattern == "all" else f"{pattern}*.htm"
+    fichiers = sorted(glob.glob(os.path.join(dossier_html, filename_pattern)))
+    if limite is not None:
+        fichiers = fichiers[:limite]
+
+    logger.info(f"{len(fichiers)} HTML files found")
+    logger.info("Semantic local mode")
+
+    fichiers_data = [(fichier, image_base_url) for fichier in fichiers]
+
+    with open(fichier_sortie, "w", encoding="utf-8") as f_out:
+        pass
+
+    files_processed = 0
+    files_failed = 0
+
+    with tqdm(total=len(fichiers_data), desc="Processing", unit="file") as pbar:
+        for fichier_data in fichiers_data:
+            result = traiter_fichier_semantic_local(fichier_data)
+            if result is not None:
+                with open(fichier_sortie, "a", encoding="utf-8") as f_out:
+                    f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
+                files_processed += 1
+            else:
+                files_failed += 1
+            pbar.set_postfix(processed=files_processed, failed=files_failed)
+            pbar.update(1)
+
+    logger.info(f"Semantic processing complete: {files_processed} processed, {files_failed} failed")
+    logger.info(f"Output: {fichier_sortie}")
+
+
+def import_semantic_documents_from_s3(
+    pattern: str = "N",
+    limite: int | None = None,
+    staging: bool = False,
+    image_base_url: str = DEFAULT_IMAGE_BASE_URL,
+    cis: str | None = None,
+) -> None:
+    """Parse documents from S3 and upsert their semantic HTML into PostgreSQL.
+
+    This experimental pipeline is deliberately independent from the legacy
+    JSONL pipeline. In particular, it never moves source files out of staging.
+    """
+    if pattern not in {"N", "R"}:
+        raise ValueError('pattern must be "N" or "R"')
+
+    s3_client = make_s3_client()
+    config = get_config()
+    table = "notices" if pattern == "N" else "rcp"
+
+    logger.info("Loading authorized CIS codes and filename mapping...")
+    cis_autorises = get_authorized_cis()
+    mapping = get_filename_to_cis_mapping()
+    glossary_terms = get_glossary_terms(config.postgres)
+    logger.info("Loaded %d glossary terms to annotate", len(glossary_terms))
+
+    if cis is not None:
+        cis = str(cis)
+        logger.info("Restricting semantic import to CIS %s", cis)
+
+    if staging:
+        keys = sorted(s3_client.list_staging_html_files(pattern))
+    else:
+        keys = sorted(s3_client.list_html_files(pattern))
+
+    candidates = []
+    skipped = 0
+    for key in keys:
+        filename = key.split("/")[-1]
+        mapped_cis = mapping.get(filename)
+        document_cis = str(mapped_cis) if mapped_cis is not None else ""
+        if not document_cis or document_cis not in cis_autorises or (cis is not None and document_cis != cis):
+            skipped += 1
+            continue
+        candidates.append((key, filename, document_cis))
+
+    if limite is not None:
+        candidates = candidates[:limite]
+
+    logger.info(f"{len(candidates)} semantic documents to process, {skipped} skipped before parsing")
+    parse_errors = 0
+
+    def parsed_records():
+        nonlocal parse_errors
+        for key, filename, cis in tqdm(candidates, desc="Semantic documents", unit="file"):
+            try:
+                source = s3_client.download_file_content(key)
+                document = parse_semantic_document(
+                    source,
+                    image_base_url=image_base_url,
+                    glossary_terms=glossary_terms,
+                )
+                yield {
+                    "cis": cis,
+                    "filename": filename,
+                    "date_notif": document.date_notif.isoformat() if document.date_notif else None,
+                    "indication": document.indication,
+                    "content_html": document.content_html,
+                }
+            except Exception as e:
+                logger.error(f"Error parsing {key}: {e}")
+                parse_errors += 1
+
+    imported, db_errors = import_semantic_documents(parsed_records(), table, config.postgres)
+    logger.info(
+        "Semantic import complete: %d imported, %d parse errors, %d database errors, %d skipped",
+        imported,
+        parse_errors,
+        db_errors,
+        skipped,
+    )
 
 
 def traiter_depuis_s3(
@@ -317,6 +484,49 @@ def traiter_depuis_s3(
             logger.info(f"Batch {batch_num + 1}: {len(batch_keys)} files moved to main prefix")
 
     logger.info(f"Processing complete: {total_processed} processed, {total_skipped} skipped")
+
+
+def telecharger_html_depuis_s3(
+    dossier_sortie: str,
+    limite: int | None = None,
+    pattern: str = "N",
+    staging: bool = False,
+) -> None:
+    """
+    Download raw HTML files from S3 into a local folder for parser testing.
+
+    Args:
+        dossier_sortie: Local output directory
+        limite: Maximum number of files to download
+        pattern: File pattern to process ("N" for Notices, "R" for RCP)
+        staging: If True, download files from the staging prefix
+    """
+    s3_client = make_s3_client()
+    output_dir = Path(dossier_sortie)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    keys = s3_client.list_staging_html_files(pattern) if staging else s3_client.list_html_files(pattern)
+    total_downloaded = 0
+
+    logger.info(f"Downloading HTML files for pattern '{pattern}' into {output_dir}")
+    if limite is not None:
+        logger.info(f"Limit: {limite} file(s)")
+
+    with tqdm(total=limite, desc="Downloading", unit="file") as pbar:
+        for key in keys:
+            if limite is not None and total_downloaded >= limite:
+                break
+
+            filename = s3_client.get_filename_from_key(key)
+            destination = output_dir / filename
+            content = s3_client.download_file_content(key)
+            destination.write_bytes(content)
+
+            total_downloaded += 1
+            pbar.update(1)
+            pbar.set_postfix(file=filename)
+
+    logger.info(f"Downloaded {total_downloaded} file(s) to {output_dir}")
 
 
 def run_pediatric_classification(
@@ -468,7 +678,7 @@ def run_pediatric_classification(
 
 def db_import(pattern: str, limite: int | None = None, since: date | None = None) -> None:
     """
-    Import parsed JSONL files from S3 into PostgreSQL.
+    Import legacy-tree or semantic-HTML JSONL files from S3 into PostgreSQL.
 
     Args:
         pattern: "N" for Notices, "R" for RCP.
@@ -506,12 +716,26 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
                 logger.error(f"Failed to parse line {line_num} in {key}: {e}")
                 parse_errors += 1
 
-        imported, db_errors = import_to_postgres(
-            tqdm(records, desc="records", unit="rec", leave=False),
-            main_table,
-            content_table,
-            config.postgres,
-        )
+        semantic_records = [record for record in records if "content_html" in record]
+        legacy_records = [record for record in records if "content_html" not in record]
+        imported = db_errors = 0
+        if semantic_records:
+            semantic_imported, semantic_errors = import_semantic_documents(
+                tqdm(semantic_records, desc="semantic records", unit="rec", leave=False),
+                main_table,
+                config.postgres,
+            )
+            imported += semantic_imported
+            db_errors += semantic_errors
+        if legacy_records:
+            legacy_imported, legacy_errors = import_to_postgres(
+                tqdm(legacy_records, desc="records", unit="rec", leave=False),
+                main_table,
+                content_table,
+                config.postgres,
+            )
+            imported += legacy_imported
+            db_errors += legacy_errors
         total_imported += imported
         total_errors += parse_errors + db_errors
         logger.info(f"{key}: {imported} imported, {parse_errors + db_errors} errors")
@@ -552,47 +776,23 @@ def run_centralise_fetch(cis: str | None = None, refresh: bool = False, limite: 
     logger.info(f"{len(urls)} distinct PDF(s) to acquire (refresh={refresh})")
 
     acquired = 0
-    for url in tqdm(urls, desc="PDFs", unit="pdf"):
-        try:
-            # Warming the cache only needs a cheap existence check, not the bytes.
-            if not refresh and s3_client.object_exists(pdf_cache_key(url)):
-                logger.info(f"Already cached: {url} (shared by {len(worklist[url])} CIS)")
+    with tqdm(urls, desc="PDFs", unit="pdf") as pbar:
+        for url in pbar:
+            try:
+                # Warming the cache only needs a cheap existence check, not the bytes.
+                key = pdf_cache_key(url)
+                if not refresh and s3_client.object_exists(key):
+                    pbar.set_postfix_str(f"cache: {key.rsplit('/', 1)[-1]}")
+                    acquired += 1
+                    continue
+                pdf = get_ema_pdf(url, s3_client, refresh=refresh)
+                logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
                 acquired += 1
-                continue
-            pdf = get_ema_pdf(url, s3_client, refresh=refresh)
-            logger.info(f"{url}: {len(pdf)} bytes, shared by {len(worklist[url])} CIS")
-            acquired += 1
-            time.sleep(1.0)  # polite gap between real EMA hits to avoid 429s
-        except Exception as e:
-            logger.error(f"Failed to acquire {url}: {e}")
+                time.sleep(1.0)  # polite gap between real EMA hits to avoid 429s
+            except Exception as e:
+                logger.error(f"Failed to acquire {url}: {e}")
 
     logger.info(f"Acquisition complete: {acquired}/{len(urls)} PDFs cached")
-
-
-def _write_parsed(
-    records: list[dict], pattern: str, timestamp: str, output_dir: str | None, batch_num: int | None = None
-) -> None:
-    """Write fanned-out JSONL records for one pattern, to a local dir or S3.
-
-    When ``batch_num`` is given, the filename carries a ``_batchNNN`` suffix so a
-    long run flushes many files instead of one, keeping progress durable.
-    """
-    if not records:
-        logger.info(f"No {pattern} records to write")
-        return
-    suffix = f"_batch{batch_num:03d}" if batch_num is not None else ""
-    filename = f"parsed_{pattern}_{timestamp}{suffix}.jsonl"
-    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(body + "\n")
-        logger.info(f"Wrote {len(records)} {pattern} records to {path}")
-    else:
-        key = f"{get_config().s3.output_prefix}{filename}"
-        make_s3_client().upload_file_content(key, body, content_type="application/x-ndjson")
-        logger.info(f"Wrote {len(records)} {pattern} records to S3: {key}")
 
 
 def _load_processed_slugs(path: str | None) -> set[str]:
@@ -627,54 +827,76 @@ def _upload_images(s3_client, images: dict) -> int:
 def run_centralise_parse(
     cis: str | None = None,
     pdf_path: str | None = None,
-    output_dir: str | None = None,
     limite: int | None = None,
     batch_size: int = 500,
     processed_file: str | None = None,
 ) -> None:
-    """Parse centralised EMA PDFs into RCP + Notice JSONL, one line per CIS.
+    """Parse centralised EMA PDFs and upsert semantic HTML directly into PostgreSQL.
 
     A PDF bundles one presentation per device (cartouche, pen, …); worklist mode
     (default) fetches each distinct PDF via the S3 cache, parses all its
     presentations once, and matches each CIS to its own via ``SpecDenom01``.
-    ``--pdf`` parses a single local file and emits every presentation for
-    inspection (writes locally) — for prototyping.
+    ``--pdf`` parses a local file, matches the requested ``--cis``, and imports
+    that presentation directly.
 
-    Worklist mode flushes output every ``batch_size`` records so a crash keeps
-    completed batches. With ``processed_file`` set, parsed PDF slugs are recorded
-    there after each flush and skipped on a re-run, so an interrupted run resumes
-    without re-parsing.
+    Records are imported every ``batch_size`` matched documents. Each database
+    document commits independently. With ``processed_file`` set, PDF slugs are
+    recorded only after their whole batch imports without database errors.
     """
     from .centralise.match import match_presentation
-    from .centralise.parser import assemble_document, parse_pdf
+    from .centralise.parser import parse_pdf
+    from .db import get_centralised_worklist
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    def record(doc: dict, filename: str, cis_code: str, title: str) -> dict:
+    def record(doc: dict, filename: str, cis_code: str) -> dict:
         return {
-            "source": {"filename": filename, "cis": cis_code, "denomination": doc["denomination"]},
-            "content": assemble_document(doc["content"], title, doc["date_notif"]),
+            "cis": cis_code,
+            "filename": filename,
+            "date_notif": doc["date_notif"],
+            "indication": doc["indication"],
+            "content_html": doc["content_html"],
         }
+
+    config = get_config()
+    s3_client = make_s3_client()
+    glossary_terms = get_glossary_terms(config.postgres)
+    logger.info("Loaded %d glossary terms to annotate", len(glossary_terms))
 
     if pdf_path:
         if not cis:
-            raise ValueError("--pdf requires --cis to tag the output record")
-        res = parse_pdf(Path(pdf_path).read_bytes())
+            raise ValueError("--pdf requires --cis to match and import the correct presentation")
+        worklist = get_centralised_worklist(cis=cis)
+        cis_row = next((row for rows in worklist.values() for row in rows if str(row[0]) == str(cis)), None)
+        if cis_row is None:
+            raise ValueError(f"No centralised medicine found for CIS {cis}")
+        denomination = cis_row[1]
+        res = parse_pdf(Path(pdf_path).read_bytes(), glossary_terms=glossary_terms)
+        uploaded = _upload_images(s3_client, res["images"])
         filename = os.path.basename(pdf_path)
-        rcp_lines = [record(d, filename, cis, d["denomination"]) for d in res["rcp"]]
-        notice_lines = [record(d, filename, cis, d["denomination"]) for d in res["notice"]]
-        output_dir = output_dir or "."  # prototyping: default to local cwd
-        if res["images"]:
-            logger.info(f"{len(res['images'])} image(s) referenced (not uploaded in --pdf mode)")
-        logger.info(f"Parsed {len(rcp_lines)} RCP + {len(notice_lines)} Notice record(s)")
-        _write_parsed(rcp_lines, "R", timestamp, output_dir)
-        _write_parsed(notice_lines, "N", timestamp, output_dir)
+        rcp_doc = match_presentation(denomination, res["rcp"])
+        notice_doc = match_presentation(denomination, res["notice"])
+        if rcp_doc is None and notice_doc is None:
+            raise ValueError(f"No RCP or Notice presentation matched CIS {cis}")
+        rcp_records = [record(rcp_doc, filename, cis)] if rcp_doc else []
+        notice_records = [record(notice_doc, filename, cis)] if notice_doc else []
+        rcp_imported, rcp_errors = (
+            import_semantic_documents(rcp_records, "rcp", config.postgres) if rcp_records else (0, 0)
+        )
+        notice_imported, notice_errors = (
+            import_semantic_documents(notice_records, "notices", config.postgres) if notice_records else (0, 0)
+        )
+        if rcp_errors or notice_errors:
+            raise RuntimeError(f"Database import failed for {rcp_errors + notice_errors} document(s)")
+        logger.info(
+            "Imported %d RCP + %d Notice document(s) for CIS %s; uploaded %d new image(s)",
+            rcp_imported,
+            notice_imported,
+            cis,
+            uploaded,
+        )
         return
 
     from .centralise.acquire import get_ema_pdf, pdf_cache_key
-    from .db import get_centralised_worklist
 
-    s3_client = make_s3_client()
     worklist = get_centralised_worklist(cis=cis)
     urls = list(worklist)
     if limite is not None:
@@ -684,51 +906,74 @@ def run_centralise_parse(
     if already_done:
         logger.info(f"{len(already_done)} PDF(s) already processed (from {processed_file}); skipping those")
 
-    rcp_lines: list[dict] = []
-    notice_lines: list[dict] = []
-    pending_slugs: list[str] = []  # slugs buffered but not yet flushed to durable storage
+    rcp_records: list[dict] = []
+    notice_records: list[dict] = []
+    pending_slugs: list[str] = []
     batch_num = 0
-    total_rcp = total_notice = total_images = 0
+    total_rcp = total_notice = total_images = total_db_errors = 0
 
     def flush() -> None:
-        nonlocal batch_num, total_rcp, total_notice, rcp_lines, notice_lines, pending_slugs
-        if not rcp_lines and not notice_lines:
+        nonlocal batch_num, total_rcp, total_notice, total_db_errors
+        nonlocal rcp_records, notice_records, pending_slugs
+        if not rcp_records and not notice_records:
             return
         batch_num += 1
-        _write_parsed(rcp_lines, "R", timestamp, output_dir, batch_num=batch_num)
-        _write_parsed(notice_lines, "N", timestamp, output_dir, batch_num=batch_num)
-        _append_processed_slugs(processed_file, pending_slugs)  # only after the batch is written
-        total_rcp += len(rcp_lines)
-        total_notice += len(notice_lines)
-        rcp_lines, notice_lines, pending_slugs = [], [], []
+        rcp_imported, rcp_errors = (
+            import_semantic_documents(rcp_records, "rcp", config.postgres) if rcp_records else (0, 0)
+        )
+        notice_imported, notice_errors = (
+            import_semantic_documents(notice_records, "notices", config.postgres) if notice_records else (0, 0)
+        )
+        batch_errors = rcp_errors + notice_errors
+        total_rcp += rcp_imported
+        total_notice += notice_imported
+        total_db_errors += batch_errors
+        if batch_errors:
+            logger.error(
+                "Batch %d had %d database error(s); its PDF slugs were not marked processed",
+                batch_num,
+                batch_errors,
+            )
+        else:
+            _append_processed_slugs(processed_file, pending_slugs)
+        rcp_records, notice_records, pending_slugs = [], [], []
 
     todo = [u for u in urls if pdf_cache_key(u).split("/")[-1] not in already_done]
     logger.info(f"{len(todo)} distinct PDF(s) to parse ({len(urls) - len(todo)} skipped)")
 
-    for url in tqdm(todo, desc="PDFs", unit="pdf"):
-        try:
-            res = parse_pdf(get_ema_pdf(url, s3_client))
-            total_images += _upload_images(s3_client, res["images"])  # before records reference them
-            filename = pdf_cache_key(url).split("/")[-1]
-            for cis_code, denom in worklist[url]:
-                rcp_doc = match_presentation(denom, res["rcp"])
-                notice_doc = match_presentation(denom, res["notice"])
-                title = denom or (rcp_doc or notice_doc or {}).get("denomination", "")
-                if rcp_doc:
-                    rcp_lines.append(record(rcp_doc, filename, cis_code, title))
-                if notice_doc:
-                    notice_lines.append(record(notice_doc, filename, cis_code, title))
-            pending_slugs.append(filename)
-            if len(rcp_lines) >= batch_size or len(notice_lines) >= batch_size:
-                flush()  # flush at a PDF boundary so a slug is only recorded once its records are durable
-        except Exception as e:
-            logger.error(f"Failed to parse {url}: {e}")
+    with tqdm(todo, desc="PDFs", unit="pdf") as pbar:
+        for url in pbar:
+            try:
+                res = parse_pdf(
+                    get_ema_pdf(
+                        url,
+                        s3_client,
+                        on_cache_hit=lambda key: pbar.set_postfix_str(f"cache: {key.rsplit('/', 1)[-1]}"),
+                    ),
+                    glossary_terms=glossary_terms,
+                )
+                total_images += _upload_images(s3_client, res["images"])  # before records reference them
+                filename = pdf_cache_key(url).split("/")[-1]
+                for cis_code, denom in worklist[url]:
+                    rcp_doc = match_presentation(denom, res["rcp"])
+                    notice_doc = match_presentation(denom, res["notice"])
+                    if rcp_doc:
+                        rcp_records.append(record(rcp_doc, filename, cis_code))
+                    if notice_doc:
+                        notice_records.append(record(notice_doc, filename, cis_code))
+                pending_slugs.append(filename)
+                if len(rcp_records) >= batch_size or len(notice_records) >= batch_size:
+                    flush()
+            except Exception as e:
+                logger.error(f"Failed to parse {url}: {e}")
 
     flush()  # final partial batch
     logger.info(
-        f"Parsed {total_rcp} RCP + {total_notice} Notice record(s) in {batch_num} batch(es); "
-        f"uploaded {total_images} new image(s)"
+        f"Imported {total_rcp} RCP + {total_notice} Notice document(s) in {batch_num} batch(es); "
+        f"uploaded {total_images} new image(s); {total_db_errors} database error(s)"
     )
+    if total_db_errors:
+        raise RuntimeError(f"Centralised import completed with {total_db_errors} database error(s)")
 
 
 def run_index_sections(
@@ -762,6 +1007,12 @@ Examples:
   # Local mode with CIS file override
   infomedicament-dataeng local ./html_files --cis-file cis_list.txt -o output.jsonl
 
+  # Test the semantic document parser locally (no database required)
+  infomedicament-dataeng semantic-local ./html_files -o semantic_output.jsonl --limit 10
+
+  # Experimental semantic parser: S3 documents directly to PostgreSQL
+  infomedicament-dataeng semantic-s3-import --pattern N --staging --limit 10
+
   # S3 mode (production on Scalingo)
   infomedicament-dataeng s3 --pattern N
 
@@ -789,6 +1040,41 @@ Environment variables for database:
     local_parser.add_argument("--processes", type=int, default=None, help="Number of processes")
     local_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
 
+    # Local semantic HTML mode
+    semantic_parser = subparsers.add_parser(
+        "semantic-local", help="Process local notices and RCPs into semantic HTML JSONL"
+    )
+    semantic_parser.add_argument("dossier_html", help="Folder containing N*.htm and/or R*.htm files")
+    semantic_parser.add_argument("--output", "-o", default="semantic_output.jsonl", help="Output JSONL file")
+    semantic_parser.add_argument("--limit", type=int, help="Limit number of files to process")
+    semantic_parser.add_argument(
+        "--pattern", default="all", choices=["N", "R", "all"], help="Documents to process (default: all)"
+    )
+    semantic_parser.add_argument(
+        "--image-base-url",
+        default=DEFAULT_IMAGE_BASE_URL,
+        help="Base URL used to rewrite relative image paths",
+    )
+
+    # Experimental semantic parser: S3 directly to PostgreSQL
+    semantic_s3_parser = subparsers.add_parser(
+        "semantic-s3-import",
+        help="Parse S3 Notices/RCPs as semantic HTML and upsert content_html",
+    )
+    semantic_s3_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
+    semantic_s3_parser.add_argument("--cis", help="Process only the document for this CIS code")
+    semantic_s3_parser.add_argument("--limit", type=int, help="Limit number of documents processed")
+    semantic_s3_parser.add_argument(
+        "--staging",
+        action="store_true",
+        help="Read documents from staging without moving them",
+    )
+    semantic_s3_parser.add_argument(
+        "--image-base-url",
+        default=DEFAULT_IMAGE_BASE_URL,
+        help="Base URL used to rewrite relative document images",
+    )
+
     # S3 mode
     s3_parser = subparsers.add_parser("s3", help="Process from S3 (Clever Cloud Cellar)")
     s3_parser.add_argument("--cis-file", help="CIS file (default: uses database)")
@@ -800,6 +1086,17 @@ Environment variables for database:
         "--staging",
         action="store_true",
         help="Process only files in the staging subdirectory and move them to the main prefix after parsing",
+    )
+
+    # Download HTML files from S3 for local testing
+    download_parser = subparsers.add_parser("download-html", help="Download raw HTML files from S3 locally")
+    download_parser.add_argument("output_dir", help="Local output directory")
+    download_parser.add_argument("--limite", type=int, help="Limit number of files to download")
+    download_parser.add_argument("--pattern", default="N", choices=["N", "R"], help="N=Notice, R=RCP")
+    download_parser.add_argument(
+        "--staging",
+        action="store_true",
+        help="Download files from the staging subdirectory",
     )
 
     # SQL to CSV mode
@@ -871,22 +1168,19 @@ Environment variables for database:
     )
     centralise_fetch_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to fetch")
 
-    # centralise parse — parse PDFs into RCP + Notice JSONL (one line per CIS)
+    # centralise parse — parse PDFs and import semantic RCP + Notice HTML
     centralise_parse_parser = centralise_subparsers.add_parser(
-        "parse", help="Parse EMA PDFs into RCP + Notice JSONL, one line per CIS"
+        "parse", help="Parse EMA PDFs and import semantic RCP + Notice HTML directly into PostgreSQL"
     )
     centralise_parse_parser.add_argument("--cis", help="Parse only the PDF for this CIS code")
-    centralise_parse_parser.add_argument("--pdf", help="Parse a single local PDF file (requires --cis); writes locally")
-    centralise_parse_parser.add_argument(
-        "--output-dir", "-o", help="Write parsed_R/N_*.jsonl locally to this dir (default: S3)"
-    )
+    centralise_parse_parser.add_argument("--pdf", help="Import a single local PDF file (requires --cis)")
     centralise_parse_parser.add_argument("--limite", type=int, help="Limit number of distinct PDFs to parse")
     centralise_parse_parser.add_argument(
-        "--batch-size", type=int, default=500, help="Records per output JSONL batch file (default: 500)"
+        "--batch-size", type=int, default=500, help="Matched documents per database import batch (default: 500)"
     )
     centralise_parse_parser.add_argument(
         "--processed-file",
-        help="Text file of already-parsed PDF slugs; parsed PDFs are appended here and skipped on re-run",
+        help="Text file of imported PDF slugs; successful PDFs are appended and skipped on re-run",
     )
 
     # Index into OpenSearch (subcommand group)
@@ -980,10 +1274,48 @@ Environment variables for database:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
 
+    elif args.command == "semantic-local":
+        try:
+            traiter_dossier_semantic_local(
+                args.dossier_html,
+                fichier_sortie=args.output,
+                limite=args.limit,
+                pattern=args.pattern,
+                image_base_url=args.image_base_url,
+            )
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "semantic-s3-import":
+        try:
+            import_semantic_documents_from_s3(
+                pattern=args.pattern,
+                limite=args.limit,
+                staging=args.staging,
+                image_base_url=args.image_base_url,
+                cis=args.cis,
+            )
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
     elif args.command == "sql-to-csv":
         try:
             output_path = Path(args.output) if args.output else None
             sql_to_csv(Path(args.sql_file), output_path, args.encoding, args.dialect)
+        except Exception as e:
+            logger.exception(f"Error: {e}")
+            raise SystemExit(1)
+
+    elif args.command == "download-html":
+        try:
+            telecharger_html_depuis_s3(
+                args.output_dir,
+                limite=args.limite,
+                pattern=args.pattern,
+                staging=args.staging,
+            )
         except Exception as e:
             logger.exception(f"Error: {e}")
             raise SystemExit(1)
@@ -1056,7 +1388,6 @@ Environment variables for database:
                 run_centralise_parse(
                     cis=args.cis,
                     pdf_path=args.pdf,
-                    output_dir=args.output_dir,
                     limite=args.limite,
                     batch_size=args.batch_size,
                     processed_file=args.processed_file,

@@ -5,6 +5,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 from ..config import get_config
 from ..s3 import S3Client, make_s3_client
@@ -65,7 +66,13 @@ def _fetch_from_ema(url: str) -> bytes:
     raise RuntimeError("unreachable")  # loop either returns or raises
 
 
-def get_ema_pdf(url: str, s3_client: S3Client | None = None, *, refresh: bool = False) -> bytes:
+def get_ema_pdf(
+    url: str,
+    s3_client: S3Client | None = None,
+    *,
+    refresh: bool = False,
+    on_cache_hit: Callable[[str], None] | None = None,
+) -> bytes:
     """Return the PDF bytes for an EMA PI URL, using the S3 cache.
 
     Serves from S3 when the PDF is already cached, unless ``refresh`` is set. On
@@ -73,6 +80,8 @@ def get_ema_pdf(url: str, s3_client: S3Client | None = None, *, refresh: bool = 
     ``.sha256`` sidecar (for parse-step idempotency), and returns the bytes.
 
     EMA is hit at most once per distinct PDF, ever, unless ``refresh`` is passed.
+    ``on_cache_hit`` can update an interactive display without emitting a log
+    line for every cached PDF.
     """
     if s3_client is None:
         s3_client = make_s3_client()
@@ -80,7 +89,9 @@ def get_ema_pdf(url: str, s3_client: S3Client | None = None, *, refresh: bool = 
     key = pdf_cache_key(url)
 
     if not refresh and s3_client.object_exists(key):
-        logger.info(f"Cache hit: {key}")
+        logger.debug(f"Cache hit: {key}")
+        if on_cache_hit is not None:
+            on_cache_hit(key)
         return s3_client.download_file_content(key)
 
     pdf_bytes = _fetch_from_ema(url)

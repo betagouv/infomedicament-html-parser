@@ -58,13 +58,16 @@ class S3Client:
             Object keys for matching HTML files
         """
         prefix = self.config.notice_prefix if pattern == "N" else self.config.rcp_prefix
+        yield from self._list_direct_html_files(prefix)
 
+    def _list_direct_html_files(self, prefix: str) -> Iterator[str]:
+        """List HTML objects immediately below a prefix, excluding nested prefixes."""
         paginator = self.client.get_paginator("list_objects_v2")
-
-        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=prefix):
+        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=prefix, Delimiter="/"):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith(".htm") or key.endswith(".html"):
+                relative_key = key.removeprefix(prefix)
+                if "/" not in relative_key and (key.endswith(".htm") or key.endswith(".html")):
                     yield key
 
     def download_file_content(self, key: str) -> bytes:
@@ -141,13 +144,7 @@ class S3Client:
         """
         html_prefix = self.config.notice_prefix if pattern == "N" else self.config.rcp_prefix
         staging_prefix = f"{html_prefix}staging/"
-
-        paginator = self.client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=staging_prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".htm") or key.endswith(".html"):
-                    yield key
+        yield from self._list_direct_html_files(staging_prefix)
 
     def move_file(self, source_key: str, dest_key: str) -> None:
         """

@@ -3,10 +3,16 @@
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 
 from infomedicament_dataeng.centralise.extract import TextLine, _merge_same_line, _table_to_html
 from infomedicament_dataeng.centralise.match import match_presentation
-from infomedicament_dataeng.centralise.parser import _is_notice_header, assemble_document, parse_pdf
+from infomedicament_dataeng.centralise.parser import (
+    _is_notice_header,
+    _normalise_date,
+    _SemanticHtmlBuilder,
+    parse_pdf,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ABASAGLAR_PDF = FIXTURES_DIR / "abasaglar-epar-product-information_fr.pdf"
@@ -25,28 +31,17 @@ def parsed() -> dict:
 
 
 @pytest.fixture(scope="module")
-def rcp(parsed) -> list:
-    return parsed["rcp"][0]["content"]  # cartouche SmPC is first
+def rcp(parsed) -> BeautifulSoup:
+    return BeautifulSoup(parsed["rcp"][0]["content_html"], "html.parser")  # cartouche SmPC is first
 
 
 @pytest.fixture(scope="module")
-def notice(parsed) -> list:
-    return parsed["notice"][0]["content"]  # cartouche notice is first
+def notice(parsed) -> BeautifulSoup:
+    return BeautifulSoup(parsed["notice"][0]["content_html"], "html.parser")  # cartouche notice is first
 
 
-def _headings(nodes, heading_type):
-    return [n["content"] for n in nodes if n.get("type") == heading_type]
-
-
-def _find(nodes, prefix, heading_type):
-    return next(n for n in nodes if n.get("type") == heading_type and n["content"].startswith(prefix))
-
-
-def _iter_all(nodes):
-    for n in nodes:
-        yield n
-        if n.get("type") != "table":  # mirror the importer's is_table guard (only literal "table" is skipped)
-            yield from _iter_all(n.get("children", []))
+def _headings(document, tag):
+    return [heading.get_text(" ", strip=True) for heading in document.find_all(tag)]
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +72,20 @@ class TestExtractHelpers:
         assert html.startswith("<table><tbody>")
         assert "<td>a &amp; b</td>" in html
         assert "<td></td>" in html  # None cell
+
+    def test_pdf_builder_constructs_semantic_elements_directly(self):
+        builder = _SemanticHtmlBuilder("rcp", "https://cdn.example.test/images", "images/", {})
+        builder.add(TextLine("1. DÉNOMINATION DU MÉDICAMENT", 11, True, 0, 10, 20))
+        builder.add(TextLine("Example medicine", 11, False, 0, 30, 40))
+        builder.add(TextLine("- First item", 11, False, 0, 50, 60))
+        builder.add(TextLine("2. COMPOSITION QUALITATIVE ET QUANTITATIVE", 11, True, 0, 70, 80))
+
+        fragment = builder.finish()
+
+        assert fragment.startswith('<h2 id="RcpDenomination">1. DÉNOMINATION DU MÉDICAMENT</h2>')
+        assert "<p>Example medicine</p>" in fragment
+        assert "<ul><li>First item</li></ul>" in fragment
+        assert 'class="' not in fragment
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +134,125 @@ class TestMatching:
         matched = match_presentation("BRINTELLIX 20 mg, comprimé pelliculé", docs)
         assert "comprimé" in matched["denomination"]
 
+    def test_strength_beats_token_overlap(self):
+        # Humalog: the 100 U/mL SmPC bundles three devices, so its long denomination
+        # loses on Jaccard to the standalone 200 U/mL one. The strength is decisive.
+        docs = [
+            {
+                "denomination": (
+                    "Humalog 100 unités/mL solution injectable en flacon "
+                    "Humalog 100 unités/mL solution injectable en cartouche "
+                    "Humalog 100 unités/mL KwikPen solution injectable en stylo pré-rempli"
+                )
+            },
+            {"denomination": "Humalog 200 unités/mL KwikPen solution injectable en stylo pré-rempli"},
+        ]
+        name = "HUMALOG 100 UI/ml KWIKPEN, solution injectable en stylo pré-rempli"
+        assert "100 unités/mL KwikPen" in match_presentation(name, docs)["denomination"]
+
+    def test_pack_volume_is_not_a_strength(self):
+        # A shared "3 mL" pack volume must not rescue the wrong strength.
+        docs = [
+            {"denomination": "Humalog 100 unités/mL KwikPen 3 mL"},
+            {"denomination": "Humalog 200 unités/mL KwikPen 3 mL stylo pré-rempli"},
+        ]
+        matched = match_presentation("HUMALOG 100 UI/ml KWIKPEN 3 ml, stylo pré-rempli", docs)
+        assert "100 unités/mL" in matched["denomination"]
+
+    def test_thousands_separator_spellings_are_equivalent(self):
+        # PDBM writes "1000 UI"; the EMA PDFs write "1 000 UI" or "1.000 UI".
+        docs = [
+            {"denomination": "Esperoct 500 UI, poudre et solvant pour solution injectable"},
+            {"denomination": "Esperoct 1 000 UI, poudre et solvant pour solution injectable"},
+            {"denomination": "Ceprotin 1.000 UI/10 ml, poudre et solvant pour solution injectable"},
+        ]
+        assert "1 000 UI" in match_presentation("ESPEROCT 1000 UI, poudre et solvant", docs)["denomination"]
+        assert "1.000 UI" in match_presentation("CEPROTIN 1000 UI/10 ml, poudre et solvant", docs)["denomination"]
+
+    def test_decimal_separator_spellings_are_equivalent(self):
+        docs = [{"denomination": "Volibris 5 mg comprimés"}, {"denomination": "Volibris 2.5 mg comprimés"}]
+        assert "2.5 mg" in match_presentation("VOLIBRIS 2,5 mg, comprimés pelliculés", docs)["denomination"]
+
+    def test_trailing_zero_decimals_are_equivalent(self):
+        # PDBM writes "EXELON 3 mg"; the PDF writes "Exelon 3,0 mg".
+        docs = [{"denomination": "Exelon 1,5 mg gélule"}, {"denomination": "Exelon 3,0 mg gélule"}]
+        assert "3,0 mg" in match_presentation("EXELON 3 mg, gélule", docs)["denomination"]
+
+    def test_insulin_mix_brand_number_is_not_a_strength(self):
+        # "Mix 50 100 UI/ml" = brand number 50 + strength 100, not "50100".
+        docs = [
+            {"denomination": "Humalog Mix25 100 unités/mL KwikPen suspension injectable en stylo pré-rempli"},
+            {"denomination": "Humalog Mix50 100 unités/mL KwikPen suspension injectable en stylo pré-rempli"},
+        ]
+        matched = match_presentation("HUMALOG MIX 50 100 UI/ml KWIKPEN, suspension injectable", docs)
+        assert matched is not None and "Mix50" in matched["denomination"]
+
+    def test_mix_number_discriminates_at_equal_strength(self):
+        # Insuman Comb 15 and Comb 25 are different medicines at the same 40 UI/ml.
+        docs = [
+            {"denomination": "Insuman Comb 25 40 UI/ml suspension injectable en flacon"},
+            {"denomination": "Insuman Comb 15 40 UI/ml suspension injectable en flacon"},
+        ]
+        matched = match_presentation("INSUMAN COMB 15 40 UI/ml, suspension injectable en flacon", docs)
+        assert "Comb 15" in matched["denomination"]
+
+    def test_absent_mix_number_skips_the_cis(self):
+        # The EU PDF covers Comb 25/50 at 40 UI/ml but not Comb 15: skip, don't guess.
+        docs = [
+            {"denomination": "Insuman Comb 25 40 UI/ml suspension injectable en flacon"},
+            {"denomination": "Insuman Comb 50 40 UI/ml suspension injectable en flacon"},
+        ]
+        assert match_presentation("INSUMAN COMB 15 40 UI/ml, suspension injectable en flacon", docs) is None
+
+    def test_welded_mix_number_still_discriminates(self):
+        # PDBM spells it "MIX50", the PDF "Mix50" — no space, still a variant number.
+        docs = [
+            {"denomination": "Humalog Mix25 100 unités/mL suspension injectable en flacon"},
+            {"denomination": "Humalog Mix50 100 unités/mL suspension injectable en flacon"},
+        ]
+        matched = match_presentation("HUMALOG MIX50 100 UI/ml, suspension injectable en flacon", docs)
+        assert "Mix50" in matched["denomination"]
+
+    def test_welded_number_never_empties_the_shortlist(self):
+        # "B12" is part of the name; it must refine at most, never skip the CIS.
+        docs = [{"denomination": "Cyano 100 microgrammes, solution injectable"}]
+        assert match_presentation("CYANO B12 100 microgrammes, solution injectable", docs) is docs[0]
+
+    def test_number_welded_into_a_word_is_not_a_variant(self):
+        # "COVID-19" must not be read as a variant number and skip the CIS.
+        docs = [
+            {"denomination": "Spikevax 0,1 mg/ml, dispersion injectable"},
+            {"denomination": "Spikevax 0,2 mg/mL, dispersion injectable"},
+        ]
+        name = "SPIKEVAX 0,2 mg/mL, dispersion injectable. Vaccin à ARNm contre la COVID-19"
+        assert "0,2 mg" in match_presentation(name, docs)["denomination"]
+
+    def test_no_matching_strength_skips_the_cis(self):
+        # Celsentri 25 mg: the EU PDF only covers 150/300 mg. Serving those is worse
+        # than serving nothing, so the CIS is skipped.
+        docs = [
+            {"denomination": "CELSENTRI 150 mg comprimés pelliculés"},
+            {"denomination": "CELSENTRI 300 mg comprimés pelliculés"},
+        ]
+        assert match_presentation("CELSENTRI 25 mg, comprimé pelliculé", docs) is None
+
+    def test_single_presentation_of_wrong_strength_is_skipped(self):
+        docs = [{"denomination": "Foscan 1 mg/mL, solution injectable"}]
+        assert match_presentation("FOSCAN 4 mg/ml, solution injectable", docs) is None
+
+    def test_unextractable_denomination_is_not_dropped(self):
+        # Section 1 failed to parse: no strength on the candidate side, so the
+        # strength check stands down rather than silently discarding the content.
+        docs = [{"denomination": "", "content": ["…"]}]
+        assert match_presentation("TEPMETKO 225 mg comprimés pelliculés", docs) is docs[0]
+
+    def test_unreadable_strength_falls_back_to_overlap(self):
+        docs = [{"denomination": "Vaxo 1 mL seringue"}, {"denomination": "Vaxo 0,5 mL seringue préremplie"}]
+        matched = match_presentation("VAXO 0,5 ml, suspension injectable en seringue préremplie", docs)
+        assert "0,5 mL" in matched["denomination"]
+
     def test_single_doc_returned_unconditionally(self):
-        only = {"denomination": "whatever", "content": [], "date_notif": ""}
+        only = {"denomination": "whatever", "content_html": "", "date_notif": None}
         assert match_presentation("unrelated name", [only]) is only
 
     def test_empty_name_with_multiple_presentations_skips(self):
@@ -154,16 +280,15 @@ class TestNoticeHeaderDetection:
 
 class TestAnnexeSplit:
     def test_rcp_has_ten_top_level_sections(self, rcp):
-        numbers = [h.split(".")[0] for h in _headings(rcp, "AmmAnnexeTitre1")]
+        numbers = [h.split(".")[0] for h in _headings(rcp, "h2")]
         assert numbers == [str(i) for i in range(1, 11)]
 
     def test_notice_has_six_sections(self, notice):
-        numbers = [h.split(".")[0] for h in _headings(notice, "AmmNoticeTitre1")]
+        numbers = [h.split(".")[0] for h in _headings(notice, "h3")]
         assert numbers == [str(i) for i in range(1, 7)]
 
     def test_rcp_section4_has_subsections_4_1_to_4_9(self, rcp):
-        section4 = _find(rcp, "4.", "AmmAnnexeTitre1")
-        subs = _headings(section4["children"], "AmmAnnexeTitre2")
+        subs = [heading for heading in _headings(rcp, "h3") if heading.startswith("4.")]
         assert [s.split()[0] for s in subs] == [f"4.{i}" for i in range(1, 10)]
 
 
@@ -174,13 +299,16 @@ class TestAnnexeSplit:
 
 class TestAnchors:
     def test_rcp_subsection_anchors(self, rcp):
-        section4 = _find(rcp, "4.", "AmmAnnexeTitre1")
-        anchors = {s["content"].split()[0]: s["anchor"] for s in section4["children"]}
+        anchors = {
+            heading.get_text(" ", strip=True).split()[0]: heading["id"]
+            for heading in rcp.find_all("h3")
+            if heading.get_text(strip=True).startswith("4.")
+        }
         assert anchors["4.1"] == "RcpIndicTherap"
         assert anchors["4.8"] == "RcpEffetsIndesirables"
 
     def test_notice_section_anchors(self, notice):
-        anchors = {n["content"].split(".")[0]: n["anchor"] for n in notice if n.get("type") == "AmmNoticeTitre1"}
+        anchors = {heading.get_text(strip=True).split(".")[0]: heading["id"] for heading in notice.find_all("h3")}
         assert anchors["1"] == "Ann3bQuestceque"
         assert anchors["2"] == "Ann3bInfoNecessaires"
         assert anchors["4"] == "Ann3bEffetsIndesirables"
@@ -191,51 +319,65 @@ class TestAnchors:
 # ---------------------------------------------------------------------------
 
 
-class TestMetadataAndTables:
+class TestSemanticContract:
     def test_rcp_denomination_is_cartouche(self, parsed):
         assert "cartouche" in parsed["rcp"][0]["denomination"].lower()
 
-    def test_assemble_document_prepends_title(self, rcp):
-        content = assemble_document(rcp, "MY TITLE", "07/2020")
-        assert content[0] == {"type": "AmmAnnexeTitre", "content": "MY TITLE"}
-        assert content[1] == {"type": "DateNotif", "content": "07/2020"}
+    def test_records_expose_semantic_html_not_content_trees(self, parsed):
+        for kind in ("rcp", "notice"):
+            for document in parsed[kind]:
+                assert "content" not in document
+                assert document["content_html"].startswith("<")
+                assert 'data-block-id="document-b0001"' in document["content_html"]
+                assert 'class="' not in document["content_html"]
+
+    def test_notice_has_document_heading_above_numbered_sections(self, notice):
+        assert notice.h2.get_text(" ", strip=True).startswith("Notice:")
+        assert notice.h3.get_text(" ", strip=True).startswith("1.")
 
     def test_table_rendered_in_section_4_8(self, rcp):
-        section4 = _find(rcp, "4.", "AmmAnnexeTitre1")
-        s48 = _find(section4["children"], "4.8", "AmmAnnexeTitre2")
-        tables = [c for c in s48["children"] if c.get("type") == "AmmCorpsTexteTable"]
-        assert tables
-        # The frontend renders from the children tree: tr -> td, cell text in `content`.
-        rows = tables[0]["children"]
-        assert rows and rows[0]["tag"] == "tr"
-        cells = rows[0]["children"]
-        assert cells and cells[0]["tag"] == "td"
-        assert isinstance(cells[0]["content"], list) and cells[0]["content"][0]
+        heading = rcp.find("h3", id="RcpEffetsIndesirables")
+        assert heading is not None
+        table = heading.find_next("table")
+        assert table is not None
+        assert table.find("td").get_text(strip=True)
 
+    def test_notice_indication_is_extracted_and_marked(self, parsed):
+        document = parsed["notice"][0]
+        assert document["indication"]
+        html = BeautifulSoup(document["content_html"], "html.parser")
+        assert html.find(attrs={"data-document-role": "indication"})
 
-class TestImporterContract:
-    def test_no_node_violates_insertion_guard(self, parsed):
-        for kind in ("rcp", "notice"):
-            for doc in parsed[kind]:
-                content = assemble_document(doc["content"], doc["denomination"], doc["date_notif"])
-                for node in _iter_all(content):
-                    has_payload = node.get("content") or node.get("children") or node.get("text")
-                    assert has_payload, f"empty node in {kind}: {node.get('type')}"
+    def test_glossary_terms_use_the_shared_semantic_annotation(self):
+        result = parse_pdf(ABASAGLAR_PDF.read_bytes(), glossary_terms=["insuline"])
+        assert '<span data-definition="insuline">insuline</span>' in result["rcp"][0]["content_html"]
 
-    def test_tables_carry_non_empty_html(self, parsed):
-        for kind in ("rcp", "notice"):
-            for doc in parsed[kind]:
-                for node in _iter_all(doc["content"]):
-                    if node.get("type") == "AmmCorpsTexteTable":
-                        assert node.get("html")
+    def test_complete_dates_are_normalised_without_inventing_partial_dates(self):
+        assert _normalise_date("09 septembre 2014") == "2014-09-09"
+        assert _normalise_date("09/09/2014") == "2014-09-09"
+        assert _normalise_date("07/2020") is None
+
+    def test_mixed_inline_bold_is_preserved(self, notice):
+        emphasis = notice.find("strong", string="Prenez contact avec un médecin rapidement")
+
+        assert emphasis is not None
+        assert emphasis.parent.name in {"p", "li"}
+        assert "Dans la plupart des cas" in emphasis.parent.get_text()
+
+    def test_pdf_underlines_are_preserved(self, rcp):
+        underline = rcp.find("u", string="Posologie")
+
+        assert underline is not None
+        assert underline.parent.name == "p"
 
 
 def _image_nodes(parsed):
-    nodes = []
-    for kind in ("rcp", "notice"):
-        for doc in parsed[kind]:
-            nodes += [n for n in _iter_all(doc["content"]) if "<img" in (n.get("html") or "")]
-    return nodes
+    return [
+        image
+        for kind in ("rcp", "notice")
+        for document in parsed[kind]
+        for image in BeautifulSoup(document["content_html"], "html.parser").find_all("img")
+    ]
 
 
 class TestImages:
@@ -249,9 +391,7 @@ class TestImages:
         nodes = _image_nodes(parsed)
         assert nodes
         keys = parsed["images"]
-        for n in nodes:
-            # rendered via html (fix-notice-img), with truthy content so the importer keeps it
-            assert n["type"] == "AmmCorpsTexte"
-            assert n.get("content")
-            sha = n["html"].split("/centralise/")[1].split('"')[0].rsplit(".", 1)[0]
+        for image in nodes:
+            assert image.parent.name == "figure"
+            sha = image["src"].split("/centralise/")[1].rsplit(".", 1)[0]
             assert any(sha in k for k in keys), "image URL must point at an uploaded blob"

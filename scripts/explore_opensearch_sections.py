@@ -1,7 +1,7 @@
 """List unique values for section_anchor, section_type, and doc_type in the specialite_sections index.
 
 Usage:
-    poetry run python scripts/explore_opensearch_sections.py
+    uv run python scripts/explore_opensearch_sections.py
 """
 
 import sys
