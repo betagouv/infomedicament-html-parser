@@ -1,8 +1,13 @@
 """Tests for DB import utilities, converted from infomedicament JS tests."""
 
 import json
+import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
+
+from infomedicament_dataeng import db
 from infomedicament_dataeng.db import _insert_content_blocks, _upsert_semantic_document, get_clean_html
 
 
@@ -187,7 +192,60 @@ def test_upsert_semantic_document_rejects_unknown_table(fake_connection):
         raise AssertionError("Unknown semantic document table should be rejected")
 
 
-def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
+def test_import_semantic_documents_logs_cis_and_root_cause(monkeypatch, caplog):
+    connection = MagicMock()
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = connection
+    monkeypatch.setattr(db, "get_postgres_engine", lambda config: engine)
+    monkeypatch.setattr(db, "_upsert_semantic_document", MagicMock(side_effect=RuntimeError("duplicate key")))
+
+    with caplog.at_level(logging.ERROR, logger="infomedicament_dataeng.db"):
+        imported, errors = db.import_semantic_documents(
+            [{"cis": "61234567", "content_html": "<p>Notice</p>"}],
+            "notices",
+        )
+
+    assert (imported, errors) == (0, 1)
+    assert "CIS 61234567 failed: duplicate key" in caplog.text
+    connection.rollback.assert_called_once()
+
+
+def test_import_semantic_documents_fail_fast_reraises(monkeypatch):
+    connection = MagicMock()
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = connection
+    monkeypatch.setattr(db, "get_postgres_engine", lambda config: engine)
+    monkeypatch.setattr(db, "_upsert_semantic_document", MagicMock(side_effect=RuntimeError("duplicate key")))
+
+    with pytest.raises(RuntimeError, match="duplicate key"):
+        db.import_semantic_documents(
+            [{"cis": "61234567", "content_html": "<p>Notice</p>"}],
+            "notices",
+            fail_fast=True,
+        )
+
+    connection.rollback.assert_called_once()
+
+
+def test_db_import_fail_fast_reraises_malformed_json(monkeypatch):
+    from infomedicament_dataeng import cli
+
+    class FakeS3:
+        def list_parsed_files(self, pattern, since=None):
+            return ["exports/parsed_N_broken.jsonl"]
+
+        def download_file_content(self, key):
+            return b'{"source": '
+
+    monkeypatch.setattr(cli, "make_s3_client", FakeS3)
+    monkeypatch.setattr(cli, "get_config", lambda: SimpleNamespace(postgres=object()))
+    monkeypatch.setattr(cli, "check_sequences", lambda tables, config: [])
+
+    with pytest.raises(json.JSONDecodeError):
+        cli.db_import("N", fail_fast=True)
+
+
+def test_db_import_auto_detects_semantic_centralise_records(monkeypatch, caplog):
     from infomedicament_dataeng import cli
 
     record = {"cis": "61234567", "content_html": "<p>Notice</p>", "date_notif": None, "indication": "Pain"}
@@ -201,12 +259,23 @@ def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
 
     semantic_calls = []
     legacy_calls = []
+    sequence_checks = []
+
+    def capture_semantic_import(records, table, config, fail_fast=False):
+        semantic_calls.append((list(records), table, fail_fast))
+        return 1, 0
+
     monkeypatch.setattr(cli, "make_s3_client", FakeS3)
     monkeypatch.setattr(cli, "get_config", lambda: SimpleNamespace(postgres=object()))
     monkeypatch.setattr(
         cli,
+        "check_sequences",
+        lambda tables, config: sequence_checks.append(tables) or [(tables[0], 1, 2, True)],
+    )
+    monkeypatch.setattr(
+        cli,
         "import_semantic_documents",
-        lambda records, table, config: semantic_calls.append((list(records), table)) or (1, 0),
+        capture_semantic_import,
     )
     monkeypatch.setattr(
         cli,
@@ -214,7 +283,10 @@ def test_db_import_auto_detects_semantic_centralise_records(monkeypatch):
         lambda records, main_table, content_table, config: legacy_calls.append(list(records)) or (0, 0),
     )
 
-    cli.db_import("N")
+    with caplog.at_level(logging.WARNING, logger="infomedicament_dataeng.cli"):
+        cli.db_import("N", fail_fast=True)
 
-    assert semantic_calls == [([record], "notices")]
+    assert semantic_calls == [([record], "notices", True)]
     assert legacy_calls == []
+    assert sequence_checks == []
+    assert "inserts will fail" not in caplog.text

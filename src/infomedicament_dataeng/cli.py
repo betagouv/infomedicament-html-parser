@@ -692,19 +692,13 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
     main_table = "notices" if pattern == "N" else "rcp"
     content_table = "notices_content" if pattern == "N" else "rcp_content"
 
-    for table, next_id, max_id, drifted in check_sequences([content_table], config=config.postgres):
-        if drifted:
-            logger.warning(
-                f"{table}: next id {next_id} but MAX(id)={max_id} — inserts will fail with"
-                f" duplicate key errors. Run: infomedicament-dataeng db-check --fix"
-            )
-
     logger.info(f"Listing parsed JSONL files for pattern '{pattern}' from S3...")
     jsonl_keys = list(s3_client.list_parsed_files(pattern, since=since))
     logger.info(f"Found {len(jsonl_keys)} files to import into '{main_table}'")
 
     total_imported = 0
     total_errors = 0
+    legacy_sequence_checked = False
 
     for key in tqdm(jsonl_keys, desc="Files", unit="file"):
         content = s3_client.download_file_content(key)
@@ -721,8 +715,10 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
         for line_num, line in enumerate(lines, start=1):
             try:
                 records.append(json.loads(line))
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse line {line_num} in {key}: {e}")
+                if fail_fast:
+                    raise
                 parse_errors += 1
 
         semantic_records = [record for record in records if "content_html" in record]
@@ -733,10 +729,19 @@ def db_import(pattern: str, limite: int | None = None, since: date | None = None
                 tqdm(semantic_records, desc="semantic records", unit="rec", leave=False),
                 main_table,
                 config.postgres,
+                fail_fast=fail_fast,
             )
             imported += semantic_imported
             db_errors += semantic_errors
         if legacy_records:
+            if not legacy_sequence_checked:
+                for table, next_id, max_id, drifted in check_sequences([content_table], config=config.postgres):
+                    if drifted:
+                        logger.warning(
+                            f"{table}: next id {next_id} but MAX(id)={max_id} — legacy inserts will fail with"
+                            f" duplicate key errors. Run: infomedicament-dataeng db-check --fix"
+                        )
+                legacy_sequence_checked = True
             legacy_imported, legacy_errors = import_to_postgres(
                 tqdm(legacy_records, desc="records", unit="rec", leave=False),
                 main_table,
@@ -1144,7 +1149,7 @@ Environment variables for database:
     db_import_parser.add_argument(
         "--fail-fast",
         action="store_true",
-        help="Abort on the first failing record and show its full traceback",
+        help="Abort on the first invalid JSON or failed database record and show its full traceback",
     )
 
     db_check_parser = subparsers.add_parser("db-check", help="Diagnose the import target tables (id sequence drift)")
@@ -1280,7 +1285,7 @@ Environment variables for database:
     )
     # --verbose is for our own code; these libraries log a wall of DEBUG per request.
     if args.verbose:
-        for noisy in ("boto3", "botocore", "s3transfer", "urllib3", "opensearch"):
+        for noisy in ("boto3", "botocore", "s3transfer", "urllib3", "opensearchpy"):
             logging.getLogger(noisy).setLevel(logging.INFO)
 
     if args.command == "local":

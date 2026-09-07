@@ -317,19 +317,29 @@ def import_semantic_documents(
     records,
     table: str,
     config: PostgresConfig | None = None,
+    fail_fast: bool = False,
 ) -> tuple[int, int]:
-    """Upsert semantic HTML into PostgreSQL, committing each document independently."""
+    """Upsert semantic HTML into PostgreSQL, committing each document independently.
+
+    Args:
+        fail_fast: Re-raise on the first failing record instead of counting it.
+    """
     engine = get_postgres_engine(config)
     imported = 0
     errors = 0
     with engine.connect() as conn:
         for record in records:
+            cis = record.get("cis", "?")
             try:
                 _upsert_semantic_document(conn, table, record)
                 conn.commit()
                 imported += 1
-            except Exception:
+            except Exception as e:
                 conn.rollback()
+                if fail_fast:
+                    raise
+                logger.error("CIS %s failed: %s", cis, str(e).split("\n")[0])
+                logger.debug("CIS %s full traceback", cis, exc_info=True)
                 errors += 1
     return imported, errors
 

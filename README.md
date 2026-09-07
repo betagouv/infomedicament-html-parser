@@ -216,6 +216,7 @@ Options:
 - `--pattern`: N=Notices, R=RCPs (required)
 - `--limite`: Limit number of records to import (for testing)
 - `--since YYYY-MM-DD`: Only import JSONL files whose filename timestamp is on or after this date.
+- `--fail-fast`: Stop on the first malformed JSON or failed database record and print its traceback.
 
 Example:
 ```bash
@@ -227,11 +228,33 @@ uv run infomedicament-dataeng db-import --pattern N --since 2026-03-18
 
 # Test with 10 records
 uv run infomedicament-dataeng db-import --pattern N --limite 10
+
+# Diagnose one failing record without continuing the import
+uv run infomedicament-dataeng db-import --pattern N --fail-fast
 ```
 
 The command lists `parsed_<pattern>_*.jsonl` files under `S3_OUTPUT_PREFIX`, downloads each one, and
 upserts the records into PostgreSQL (by `codeCIS`). Semantic records update `content_html` directly;
 historical records still replace their existing content trees.
+
+#### Legacy content sequence check
+
+Legacy tree records insert rows into `notices_content` and `rcp_content`. If either table was restored
+with explicit IDs, its PostgreSQL sequence may lag behind `MAX(id)` and cause duplicate-key errors.
+Inspect both sequences without changing them:
+
+```bash
+uv run infomedicament-dataeng db-check
+```
+
+Repair any drifted sequence by resetting its next value to `MAX(id) + 1`:
+
+```bash
+uv run infomedicament-dataeng db-check --fix
+```
+
+This check does not apply to semantic HTML records, which update the main `notices` or `rcp` table
+without inserting legacy content-tree rows. `--fix` changes the two legacy content-table sequences.
 
 ### OpenSearch Indexing
 
